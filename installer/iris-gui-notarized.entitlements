@@ -32,5 +32,17 @@
          REJECTED for the Mac App Store, which is fine — PCAP never ships there. -->
     <key>com.apple.security.automation.apple-events</key>
     <true/>
+
+    <!-- Host-camera capture for the emulated IndyCam (VINO video-in source).
+         The hardened runtime gates camera access behind this entitlement: a
+         build signed with the `runtime` codesign option and no `device.camera`
+         has AVFoundation refused before TCC is ever consulted, so the user is
+         never even prompted and
+         the capture session just yields black frames. The App Store and local
+         sandbox entitlements have always carried it; this file did not, which
+         is why the camera did not work in the notarized DMG builds. Pairs with
+         NSCameraUsageDescription in the Info.plist release.yml writes. -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
 </dict>
 </plist>

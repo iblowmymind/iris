@@ -107,22 +107,42 @@ EOF
 
 # ── Sign ────────────────────────────────────────────────────────────────────
 
-# The sandboxed variant signs with the local sandbox entitlements (app-sandbox);
-# other variants keep the existing behaviour. CODESIGN_IDENTITY overrides the
-# default ad-hoc identity (e.g. a Developer ID for persistent bookmarks).
+# The sandboxed variant signs with the local sandbox entitlements (app-sandbox).
+# Everything else signs with the *notarized* (Developer ID) entitlements — the
+# same file release.yml uses for the DMG, so a local build behaves like the one
+# users download. It used to use installer/iris-gui.entitlements, which is the
+# Mac App Store file: that carries com.apple.security.app-sandbox, so a plain
+# local build came out sandboxed while the `appstore` feature — and with it the
+# security-scoped bookmark code in macos_sandbox.rs — was NOT compiled in. The
+# result was a bundle that could not reach a disk image outside its container
+# on the next launch, for a variant that was never meant to be sandboxed at all.
+# (It also masked a missing camera entitlement in the notarized file, since the
+# App Store one has it: rules/macos/camera-needs-both-a-request-and-an-entitlement.md.)
+# Use `./scripts/build-macos.sh appstore` when you actually want the sandbox.
+# CODESIGN_IDENTITY overrides the default ad-hoc identity (e.g. a Developer ID
+# for persistent bookmarks).
 SIGN_ID="${CODESIGN_IDENTITY:--}"
 if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
     ENTITLEMENTS="installer/iris-gui-sandbox-local.entitlements"
 else
-    ENTITLEMENTS="installer/iris-gui.entitlements"
+    ENTITLEMENTS="installer/iris-gui-notarized.entitlements"
 fi
 
 echo "Signing bundle (identity: ${SIGN_ID}, entitlements: ${ENTITLEMENTS})..."
 if [ -f "$ENTITLEMENTS" ]; then
-    # Validate first: codesign's entitlements parser is strict (and an XML
-    # comment may not contain a double hyphen), and a parse failure would
-    # otherwise leave the bundle unsigned / un-sandboxed without an obvious error.
+    # Validate first: codesign's entitlements parser is strict, and a parse
+    # failure would otherwise leave the bundle unsigned / un-sandboxed without
+    # an obvious error. `plutil -lint` alone is NOT enough: it accepts a double
+    # hyphen inside an XML comment, which is illegal XML and which AMFI rejects
+    # with "Failed to parse entitlements: AMFIUnserializeXML: syntax error".
+    # Comments in these files must not contain `-` twice in a row (write
+    # "the runtime codesign option", not the flag itself).
     plutil -lint "$ENTITLEMENTS" >/dev/null
+    if sed 's/<!--//g; s/-->//g' "$ENTITLEMENTS" | grep -q -- '--'; then
+        echo "error: $ENTITLEMENTS has a double hyphen inside a comment;" >&2
+        echo "       AMFI will refuse to parse it. Reword the comment." >&2
+        exit 1
+    fi
     codesign --force --deep --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "${BUNDLE}"
 else
     codesign --force --deep --sign "$SIGN_ID" "${BUNDLE}"

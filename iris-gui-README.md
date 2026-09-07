@@ -52,7 +52,7 @@ Notable Group-B features:
 - `iris/tlbstats`, `iris/ci_clock`, `iris/gdc`, `iris/mouseabs`,
   `iris/developer*`, `iris/debug_cache` — various core tweaks.
 
-The **Help → Build features** menu lists what's compiled in.
+**Help → About IRIS** lists what's compiled in.
 
 ### Verifying that the default iris build is unaffected
 
@@ -90,14 +90,18 @@ Hit **▶ Start** to boot it.
 
 ### Menu bar
 
+On macOS these are the **system menu bar**; on other platforms they are a
+strip along the top of the window. Both are built from the same description
+(`src/menus.rs`), so the two never drift apart.
+
 | Menu | Purpose |
 | --- | --- |
 | **File** | New machine… / Switch to machine → / Rename / Delete / Import iris.toml… / Export to iris.toml… / Quit |
-| **Machine** | Start, Stop, Reset, Save state, Restore state, Screenshot |
+| **Machine** | Start, Stop, Reset, Reset NVRAM, Processor, Save/Restore state (slots snap1–4), Screenshot, Serial console, Capture mouse & keyboard |
 | **Memory** | Total presets, plus per-bank submenus |
-| **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions |
-| **View** | Fullscreen (F11), UI scale |
-| **Help** | Version + build feature listing |
+| **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions, plus commit/roll-back for copy-on-write overlays |
+| **View** | Fullscreen, emulator scale, menu & dialog scale, Configuration… |
+| **Help** | Diagnostics, the explainers, licenses, and About (version + build feature listing) |
 
 The **SCSI** menu is the recommended way to attach / detach / replace
 drives. Each ID shows its current state inline:
@@ -106,33 +110,42 @@ drives. Each ID shows its current state inline:
 - *HDD attached*: Enable/Disable COW overlay / Replace image… / Detach
 - *CD-ROM attached*: Eject / Insert disc… / Detach
 
-### Toolbar
+### The window
 
-- **▶ Start** / **■ Stop** (Stop opens the safe-stop dialog if needed)
-- **💾 Save state** / **↶ Restore state** — calls `Machine::save_snapshot` / `Machine::ci_restore` against `saves/<name>/`
-- **Edit config… / Hide config editor** — toggles the collapsible config
-  side panel (see Central panel below) for advanced settings that aren't
-  surfaced as menu actions (Network, Video-In, Debug, CI)
-- Right side: status pill (PROM / IRIX running / halted / stopped) and
-  MIPS counter
+Once a machine is running the window holds **the emulator screen and nothing
+else** — the live REX3 framebuffer, drawn centered at a whole number of device
+pixels per emulated pixel wherever it fits (see *Scaling* below). While idle it
+shows the **welcome / status panel** instead: active machine name,
+PROM/NVRAM/RAM summary, attached drive list, network mode, and the big Start
+button.
 
-### Central panel
+Everything that used to sit beside it is somewhere else now:
 
-The central panel **always shows the emulator screen** once a machine is
-running — the live REX3 framebuffer, drawn aspect-fit and centered. While
-idle it falls back to the **welcome / status panel**: active machine name,
-PROM/NVRAM/RAM summary, attached drive list, network mode, and the big
-Start button.
+- the menus are in the menu bar,
+- the config editor and every dialog are **separate windows**, so they can go
+  on another monitor and never cover the picture,
+- and the run state lives in the **window title**: machine name, PROM / IRIX
+  running / halted / stopped, MIPS, networking, on-screen scale, whether the
+  mouse and keyboard are captured, and the most recent notification. It
+  refreshes about four times a second.
 
-### Config side panel
+### Configuration window
 
-The **Edit config… / Hide config editor** toolbar toggle slides in a
-collapsible **right-hand side panel** with the tabbed editor (Network /
-Video-In / Debug / CI). It no longer covers the central panel, so you
-can change settings while watching the emulator screen. The panel is
-resizable — drag its left edge to trade width with the screen — and is
-dismissed with either the toolbar toggle or the **✕** in its header. It
-starts collapsed on each launch (open/closed state isn't persisted).
+**View → Configuration…** (⌘,) opens the tabbed editor (General / Disks /
+Network / Memory / Display / Video-In / Debug / CI) in its own window. **View →
+Configuration tab** opens it at a particular tab. It starts closed on each
+launch (open/closed state isn't persisted).
+
+### Scaling
+
+**View → Emulator scale** sets how large the guest's display is drawn, in
+logical points per emulated pixel — `1×` is the guest's own resolution, which
+is one device pixel on a standard screen and a crisp 2×2 block on a Retina one.
+The window is resized to hold exactly that, as far as the screen's usable area
+allows, and the picture is drawn at a whole number of device pixels and snapped
+to the pixel grid, so nothing is smoothed or dropped. Only when the framebuffer
+is larger than the space available is it scaled down (and then filtered); the
+title says which you are getting.
 
 The **Video-In** tab's source selector offers:
 
@@ -146,9 +159,12 @@ The **Video-In** tab's source selector offers:
 
 ### Keyboard shortcuts
 
-- **F11** — toggle fullscreen
+- **F11** — toggle fullscreen (Ctrl+Alt+F11 sends a real F11 to IRIX)
 - **Ctrl =** / **Ctrl -** / **Ctrl 0** — zoom in / out / reset (helps on
   Linux/Wayland where egui's default text size can look small)
+- Menu accelerators (⌘ on macOS, Ctrl elsewhere): **R** start, **⇧R** stop,
+  **K** capture / release mouse & keyboard, **F** fullscreen, **,**
+  configuration, **N** new machine, **Q** quit
 
 ---
 
@@ -379,7 +395,7 @@ pub mod build_features {
 ```
 
 iris-gui reads these to:
-- Surface the active feature set in **Help → Build features**.
+- Surface the active feature set in **Help → About IRIS**.
 - Warn on the **Disks** form when a `.chd` path is entered into a
   non-CHD build (currently always on for iris-gui).
 - Hide the GDB stub port input on the Debug tab under a lightning

@@ -25,7 +25,7 @@ use v4l::prelude::MmapStream;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
-use super::{Shared, downscale_yuyv_to_uyvy, split_fields};
+use super::{report_error, Shared, downscale_yuyv_to_uyvy, split_fields};
 
 // Substrings in a V4L2 card name that identify non-capture auxiliary nodes.
 const NAME_DENYLIST: &[&str] = &["overview", "metadata", "statistics"];
@@ -94,7 +94,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
             None => {
                 let delay = (open_attempts * 2).min(30);
                 if open_attempts == 0 {
-                    eprintln!("camera: no usable V4L2 device — waiting for hot-plug");
+                    report_error(&shared, "no usable V4L2 device — waiting for hot-plug");
                 }
                 thread::sleep(Duration::from_secs(delay.max(2) as u64));
                 open_attempts += 1;
@@ -112,7 +112,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         let dev = match Device::new(cur_idx) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("camera: open /dev/video{} failed: {}", cur_idx, e);
+                report_error(&shared, format!("open /dev/video{cur_idx} failed: {e}"));
                 continue 'outer;
             }
         };
@@ -120,7 +120,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         let (sw, sh) = match best_yuyv_resolution(&dev) {
             Some(r) => r,
             None => {
-                eprintln!("camera: no YUYV format on /dev/video{} — retrying", cur_idx);
+                report_error(&shared, format!("no YUYV format on /dev/video{cur_idx} — retrying"));
                 continue 'outer;
             }
         };
@@ -130,7 +130,7 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         fmt.height = sh;
         fmt.fourcc = FourCC::new(b"YUYV");
         if let Err(e) = dev.set_format(&fmt) {
-            eprintln!("camera: set_format {}×{} YUYV failed: {}", sw, sh, e);
+            report_error(&shared, format!("set_format {sw}×{sh} YUYV failed: {e}"));
             continue 'outer;
         }
 
@@ -138,7 +138,11 @@ pub(super) fn capture_loop(shared: Arc<Mutex<Shared>>, frame_w: u32, frame_h: u3
         if open_attempts == 1 {
             eprintln!("camera: OK — run 'vino status' in the monitor to check DMA state");
         }
-        shared.lock().capture_res = Some((sw, sh));
+        {
+            let mut g = shared.lock();
+            g.capture_res = Some((sw, sh));
+            g.error = None;
+        }
 
         let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
             Ok(s) => s,

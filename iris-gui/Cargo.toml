@@ -129,6 +129,13 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSURL", "NSData", "NSError", "NSString", "NSArray",
 ] }
+# The system menu bar (see src/macos_menu.rs). iris-gui's menus live in the
+# macOS menu bar rather than in the window, so the emulated display has the
+# window to itself while a machine runs.
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder",
+    "NSScreen",
+] }
 
 [[bin]]
 name = "iris-gui"
