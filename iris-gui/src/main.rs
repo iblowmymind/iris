@@ -2688,10 +2688,22 @@ impl eframe::App for App {
 
         // Zero the central panel's inner margin so the emulated display reaches
         // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
-        // a little bigger. Keep the dark panel fill so the aspect-ratio
-        // letterbox bars stay black.
+        // a little bigger.
+        //
+        // While a machine runs, paint the panel black rather than taking the
+        // theme's `panel_fill`. The space around the picture is the inside of a
+        // monitor bezel, not application chrome: the moment the window is wider
+        // than 5:4 — maximised, or fullscreen — the theme colour becomes two
+        // bright bars framing the guest's display in light mode (and merely a
+        // different grey in dark mode). Black is the only colour that reads as
+        // "there is nothing here".
         let central_frame = egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::ZERO);
+        let central_frame = if self.emu.is_running() {
+            central_frame.fill(Color32::BLACK)
+        } else {
+            central_frame
+        };
         egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             // While a machine is running the main window is the guest's display
             // and nothing else: the config editor, help and every confirmation
@@ -3133,6 +3145,18 @@ impl eframe::App for App {
                 // Keep frames coming while hidden so we reach the reveal.
                 ctx.request_repaint();
             }
+        }
+    }
+
+    /// What eframe clears the framebuffer to before any panel is drawn. Black
+    /// while a machine runs, for the same reason the central panel is: a resize
+    /// that outruns the next repaint would otherwise flash the theme colour
+    /// around the guest's display.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.emu.is_running() {
+            Color32::BLACK.to_normalized_gamma_f32()
+        } else {
+            visuals.panel_fill.to_normalized_gamma_f32()
         }
     }
 
