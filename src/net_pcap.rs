@@ -49,6 +49,69 @@ pub struct NetInterface {
     pub up: bool,
     pub running: bool,
     pub loopback: bool,
+    /// Wi-Fi. Bridging cannot work over one — see [`is_wireless`].
+    pub wireless: bool,
+}
+
+/// Whether `name` is a Wi-Fi interface.
+///
+/// This matters more than it looks: **PCAP bridging cannot work over Wi-Fi**,
+/// and the way it fails is confusing enough to be worth naming up front. An
+/// 802.11 association is bound to one MAC address, and infrastructure mode's
+/// 3-address frames have nowhere to say "this frame is for a different machine
+/// behind me" (that is what 4-address/WDS mode exists for, and client adapters
+/// do not offer it). So:
+///
+/// - Outbound, frames carrying the guest's own MAC are dropped, either by the
+///   host's Wi-Fi driver or by the access point as a spoof.
+/// - Inbound, the AP looks up the guest's MAC in its association table, finds
+///   no station, and never transmits the frame at all — promiscuous mode on
+///   the host cannot recover something the radio was never sent.
+///
+/// The trap is that it half-works: the *host* can ping and connect to the
+/// guest, because that traffic never leaves the machine (BPF taps the host's
+/// own outbound frames, and injected replies loop back locally). Everything
+/// else on the LAN sees nothing. Bridging needs a wired NIC.
+pub fn is_wireless(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // The kernel exposes a `wireless` dir / `phy80211` link for cfg80211
+        // and older WEXT drivers respectively.
+        let base = std::path::Path::new("/sys/class/net").join(name);
+        return base.join("wireless").exists() || base.join("phy80211").exists();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `networksetup` is the same mapping the user sees in System Settings.
+        // Only run at enumeration time, which is user-triggered and rare.
+        let Ok(out) = std::process::Command::new("/usr/sbin/networksetup")
+            .arg("-listallhardwareports")
+            .output()
+        else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut port_is_wifi = false;
+        for line in text.lines() {
+            if let Some(port) = line.strip_prefix("Hardware Port: ") {
+                let p = port.to_ascii_lowercase();
+                port_is_wifi = p.contains("wi-fi") || p.contains("airport");
+            } else if let Some(dev) = line.strip_prefix("Device: ") {
+                if port_is_wifi && dev.trim() == name {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Windows has no cheap device-type query here; the adapter description
+        // is what the picker shows anyway, so leave the judgement to the
+        // description check in the caller.
+        let _ = name;
+        false
+    }
 }
 
 /// Enumerate the host network interfaces libpcap can bridge onto.
@@ -61,6 +124,15 @@ pub fn list_interfaces() -> Result<Vec<NetInterface>, String> {
         .into_iter()
         .map(|d| {
             let flags = &d.flags;
+            let name_for_kind = d.name.clone();
+            // libpcap's description is the adapter name on Windows, where
+            // there is no cheap device-type query — so it doubles as the
+            // wireless hint there.
+            let wireless = is_wireless(&name_for_kind)
+                || d.desc.as_deref().is_some_and(|desc| {
+                    let d = desc.to_ascii_lowercase();
+                    d.contains("wi-fi") || d.contains("wireless") || d.contains("wlan")
+                });
             NetInterface {
                 name: d.name,
                 description: d.desc,
@@ -68,6 +140,7 @@ pub fn list_interfaces() -> Result<Vec<NetInterface>, String> {
                 up: flags.is_up(),
                 running: flags.is_running(),
                 loopback: flags.is_loopback(),
+                wireless,
             }
         })
         .collect())
@@ -92,6 +165,7 @@ pub fn format_interfaces() -> String {
                 if i.up { tags.push("up"); }
                 if i.running { tags.push("running"); }
                 if i.loopback { tags.push("loopback"); }
+                if i.wireless { tags.push("Wi-Fi: cannot bridge"); }
                 let tags_str = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(",")) };
                 // 1-based index for human selection.
                 out.push_str(&format!("  {:>2}. {}{}\n", idx + 1, i.name, tags_str));
@@ -558,12 +632,24 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// Wi-Fi detection must not claim loopback or a non-existent device is
+    /// wireless — a false positive would put a "cannot bridge" warning on an
+    /// interface that bridges fine.
+    #[test]
+    fn loopback_and_unknown_devices_are_not_wireless() {
+        assert!(!is_wireless("lo"));
+        assert!(!is_wireless("lo0"));
+        assert!(!is_wireless("no-such-device-0"));
+        assert!(!is_wireless(""));
+    }
+
     fn iface(name: &str, up: bool, running: bool, loopback: bool, has_addr: bool) -> NetInterface {
         NetInterface {
             name: name.to_string(),
             description: None,
             addresses: if has_addr { vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2))] } else { vec![] },
             up, running, loopback,
+            wireless: false,
         }
     }
 
