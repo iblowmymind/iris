@@ -7,9 +7,19 @@
 # do — and the Terminal window stays closed.
 #
 # Usage:
-#   ./scripts/build-macos.sh            # standard build
-#   ./scripts/build-macos.sh lightning  # enable iris/lightning feature
-#   ./scripts/build-macos.sh appstore   # SANDBOXED build (App Store parity)
+#   ./scripts/build-macos.sh                  # standard build
+#   ./scripts/build-macos.sh lightning        # enable iris/lightning feature
+#   ./scripts/build-macos.sh appstore         # SANDBOXED build (App Store parity)
+#   ./scripts/build-macos.sh lightning pcap   # ...plus bridged networking
+#
+# `pcap` adds bridged (PCAP) networking, which puts the guest on your real LAN
+# as its own L2 host instead of behind the built-in NAT gateway. Without it the
+# Network tab has no backend selector at all — the option is compiled out, not
+# hidden — so this is what makes bridged networking selectable. It costs
+# nothing extra to build on macOS (libpcap is in the SDK); capturing needs a
+# one-time admin install of ChmodBPF, which the app offers from the Network tab
+# on first use. It combines with any variant except the sandboxed ones, where
+# it can neither work nor ship (see below).
 #
 # The `appstore` variant compiles `--features appstore` (so the real
 # security-scoped bookmark code + IRIS_CHD_DIFF_DIR are active, not the
@@ -24,7 +34,35 @@
 
 set -e
 
-VARIANT="${1:-standard}"
+# Options are order-independent: one variant, plus any number of add-ons.
+VARIANT="standard"
+WANT_PCAP=0
+for arg in "$@"; do
+    case "$arg" in
+        standard|lightning|appstore|sandbox) VARIANT="$arg" ;;
+        pcap) WANT_PCAP=1 ;;
+        *)
+            echo "unknown option: $arg" >&2
+            echo "usage: $0 [standard|lightning|appstore] [pcap]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+SANDBOXED=0
+if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+    SANDBOXED=1
+fi
+
+# PCAP can't ship in a sandboxed build and wouldn't work in one: the capture
+# device needs an admin install the sandbox forbids, and a backend the user
+# can select but never use is exactly the kind of dangling option App Review
+# rejects. Refuse the combination rather than building something misleading.
+if [ "$WANT_PCAP" = 1 ] && [ "$SANDBOXED" = 1 ]; then
+    echo "error: pcap and the sandboxed ($VARIANT) variant are incompatible." >&2
+    echo "       The App Store build has no bridged networking by design." >&2
+    exit 1
+fi
 
 # ── Architecture ────────────────────────────────────────────────────────────
 
@@ -56,13 +94,24 @@ echo "  Bundle ID: $BUNDLE_ID"
 
 # ── Build ───────────────────────────────────────────────────────────────────
 
-if [ "$VARIANT" = "lightning" ]; then
-    cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning
-elif [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
-    # Sandbox parity: enable the bookmark code + container diff redirect.
-    # lightning gives a usable interpreter (the appstore feature forces
-    # IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
-    cargo build --release --target "$TARGET" -p iris-gui --features appstore,iris/lightning
+FEATURES=""
+add_feature() { FEATURES="${FEATURES:+$FEATURES,}$1"; }
+
+case "$VARIANT" in
+    lightning) add_feature "iris/lightning" ;;
+    appstore|sandbox)
+        # Sandbox parity: enable the bookmark code + container diff redirect.
+        # lightning gives a usable interpreter (the appstore feature forces
+        # IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
+        add_feature "appstore"
+        add_feature "iris/lightning"
+        ;;
+esac
+[ "$WANT_PCAP" = 1 ] && add_feature "pcap"
+
+echo "  Features: ${FEATURES:-(default)}"
+if [ -n "$FEATURES" ]; then
+    cargo build --release --target "$TARGET" -p iris-gui --features "$FEATURES"
 else
     cargo build --release --target "$TARGET" -p iris-gui
 fi
@@ -101,6 +150,7 @@ cat > "${BUNDLE}/Contents/Info.plist" << EOF
     <key>NSHighResolutionCapable</key><true/>
     <key>LSMinimumSystemVersion</key><string>10.13</string>
     <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+    <key>NSAppleEventsUsageDescription</key><string>Runs the one-time administrator install that grants IRIS access to packet capture (bridged networking).</string>
 </dict>
 </plist>
 EOF
@@ -122,7 +172,7 @@ EOF
 # CODESIGN_IDENTITY overrides the default ad-hoc identity (e.g. a Developer ID
 # for persistent bookmarks).
 SIGN_ID="${CODESIGN_IDENTITY:--}"
-if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+if [ "$SANDBOXED" = 1 ]; then
     ENTITLEMENTS="installer/iris-gui-sandbox-local.entitlements"
 else
     ENTITLEMENTS="installer/iris-gui-notarized.entitlements"
@@ -156,7 +206,15 @@ echo "  open ${BUNDLE}"
 echo ""
 echo "Or double-click IRIS.app in Finder."
 
-if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+if [ "$WANT_PCAP" = 1 ]; then
+    echo ""
+    echo "Bridged networking is compiled in. In the app: View -> Configuration,"
+    echo "Network tab -> Backend -> \"PCAP (bridged)\". Capturing needs access to"
+    echo "/dev/bpf*, so the first attempt offers a one-time admin ChmodBPF install;"
+    echo "quit and reopen IRIS afterwards for the new group membership to apply."
+fi
+
+if [ "$SANDBOXED" = 1 ]; then
     echo ""
     echo "This is a SANDBOXED build. Verify the sandbox is actually on:"
     echo "  codesign -d --entitlements - ${BUNDLE} 2>/dev/null | grep -A1 app-sandbox"
