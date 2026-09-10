@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent, MouseButton},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
 };
@@ -48,9 +48,37 @@ struct GlState {
     status_vbo: glow::Buffer,
 }
 
-// Snap-to request from event thread to render thread
+// Pending window-resize request, applied by the event-loop thread only.
+//
+// Every `Window` method that changes the window's size must run on the thread
+// that owns the window (the one running the event loop). On Windows this is not
+// merely a convention: `request_inner_size` reaches `SetWindowPos`, and
+// `SetWindowPos` on a window owned by *another* thread makes Win32 dispatch
+// `WM_WINDOWPOSCHANGING`/`WM_SIZE` **synchronously into the owning thread's
+// wndproc** (`SWP_ASYNCWINDOWPOS` only affects the caller's return, not the
+// callback delivery). winit's Windows `EventLoopRunner` holds its event handler
+// and buffer in `Cell`/`RefCell` with no synchronisation whatsoever, so that
+// re-entrant dispatch races the event thread's own dispatch and panics inside a
+// Win32 callback — which the OS turns into a process kill with
+// STATUS_FATAL_USER_CALLBACK_EXCEPTION (0xC000041D), no Rust backtrace.
+// Symptom seen in the wild: iris dying ~90% of launches right after REX3
+// reports its first resolution change, because that change is exactly what used
+// to call `request_inner_size` from the REX3 refresh thread.
+//
+// So both resize sources — the REX3 refresh thread's mode change and the
+// RCtrl+1/2 hotkey — only *record* what they want here; `UiApp` applies it.
 #[derive(Clone, Copy, PartialEq)]
-enum ScaleSnap { Scale1x, Scale2x }
+enum ResizeRequest {
+    /// Emulated display changed mode: snap the window to 1x of the new size.
+    DisplayMode { w: u32, h: u32 },
+    /// RCtrl+1 / RCtrl+2: snap to an integer multiple of the current display.
+    Scale(u32),
+    /// RCtrl+F11: toggle borderless fullscreen. Same deferral rationale as the
+    /// others — `set_fullscreen` inside a callback re-enters the wndproc with a
+    /// whole style/geometry change (WM_WINDOWPOSCHANGING, WM_SIZE,
+    /// possibly WM_DPICHANGED when the window lands on a different monitor).
+    ToggleFullscreen,
+}
 
 // Which context we actually got. GlCompositor and the texelFetch/integer-sampler
 // shaders need GL 3.2 core (usampler2D, #version 150). If the driver can't give us
@@ -68,19 +96,42 @@ struct GlRenderer {
     // that validate against the drawable/FBConfig being issued from a thread
     // other than the one that created the X11 connection/window.
     not_current_context: Option<NotCurrentContext>,
+    // The window surface, also built on the main thread in Ui::new() and bound
+    // once there (make_current → make_not_current) before the event loop runs.
+    // On Windows that first bind is what installs the GL ICD's window subclass
+    // and populates its per-HWND state; doing it lazily on the refresh thread
+    // while the event loop is already dispatching a startup resize raced the
+    // half-initialised driver (AMD atio6axx.dll null read — issue #94).
+    // `ensure_init()` consumes this on the true first frame; on a stop()/start()
+    // respawn it is already `None` and a fresh surface is made on the refresh
+    // thread (safe by then — the driver's window state exists).
+    // See rules/gui/windows-silent-exit-0xc000041d.md.
+    initial_surface: Option<Surface<WindowSurface>>,
     // Captured on the main thread in Ui::new(): winit 0.30 macOS returns
     // HandleError::Unavailable from window_handle() on any other thread, and
     // init_gl() runs on the refresh thread.
     raw_window_handle: RawWindowHandle,
     gl_tier: GlTier,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    // Resize wanted by this (render) thread, applied by the event thread.
+    // Never call a window-mutating method from here — see `ResizeRequest`.
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
+    // Waker for the event loop: the resize request above is useless until the
+    // event thread wakes up to notice it, and with ControlFlow::Wait an idle
+    // guest may produce no OS events at all for a long time.
+    event_proxy: EventLoopProxy<()>,
     // Current emulated display resolution (width, height), published for the
     // event thread so it can lock the window to the right aspect ratio.
     display_res: Arc<Mutex<(u32, u32)>>,
     state:       Option<GlState>,
     compositor:  Box<dyn Compositor>,
     use_gl_compositor: bool,
+    // Compositor swap asked for by `disp compositor <gl|sw>`, which arrives on
+    // a monitor/CI socket thread. Swapping means `glDeleteTextures` on the old
+    // compositor, and GL calls belong to the refresh thread that owns the
+    // context — so the request is only recorded here and serviced at the top of
+    // `present()`. See rules/gui/gl-teardown-must-run-on-the-refresh-thread.md.
+    pending_compositor: Option<bool>,
     current_w:     usize,
     current_h:     usize,
     current_win_w: usize,
@@ -130,17 +181,24 @@ impl GlRenderer {
         let not_current_gl_context = self.not_current_context.take()
             .expect("GL context missing on the true first ensure_init() call — construction bug in Ui::new()");
 
-        let size = self.window.inner_size();
-        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            self.raw_window_handle,
-            NonZeroU32::new(size.width.max(1)).unwrap(),
-            NonZeroU32::new(size.height.max(1)).unwrap(),
-        );
-        let gl_surface = unsafe {
-            gl_display
-                .create_window_surface(&self.gl_config, &attrs)
-                .unwrap()
-        };
+        // Normal boot: the surface was created and bound once on the main
+        // thread in Ui::new() — reuse it. Only after a stop()/start() cycle
+        // (jitcheck checkpoint restore, `reset`, snapshot load) is it already
+        // gone, and then a fresh one on this thread is fine: the driver's
+        // per-HWND GL state was established at startup.
+        let gl_surface = self.initial_surface.take().unwrap_or_else(|| {
+            let size = self.window.inner_size();
+            let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                self.raw_window_handle,
+                NonZeroU32::new(size.width.max(1)).unwrap(),
+                NonZeroU32::new(size.height.max(1)).unwrap(),
+            );
+            unsafe {
+                gl_display
+                    .create_window_surface(&self.gl_config, &attrs)
+                    .unwrap()
+            }
+        });
 
         let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
 
@@ -419,6 +477,20 @@ impl GlRenderer {
         let y0 = ((win_h - disp_h - sb_h) * 0.5).floor();
         (x0, y0, x0 + disp_w, y0 + disp_h, scale)
     }
+
+    /// Service a pending `disp compositor` swap. Refresh thread only: this is
+    /// where the old compositor's GL objects are actually deleted.
+    fn apply_pending_compositor(&mut self, gl: &glow::Context) {
+        let Some(use_gl) = self.pending_compositor.take() else { return };
+        if use_gl == self.use_gl_compositor { return; }
+        self.use_gl_compositor = use_gl;
+        self.compositor.destroy(gl);
+        self.compositor = if use_gl {
+            Box::new(GlCompositor::new())
+        } else {
+            Box::new(SwCompositor::new())
+        };
+    }
 }
 
 impl Renderer for GlRenderer {
@@ -458,17 +530,19 @@ impl Renderer for GlRenderer {
         let height = screen.height;
         if width == 0 || height == 0 { return; }
 
+        // Apply any pending `disp compositor` swap now, on the thread that owns
+        // the GL context. Done before the frame's `state` borrow so the old
+        // compositor's textures are deleted with a live, current context.
+        if self.pending_compositor.is_some() {
+            // Move the context out of `self.state` for the call: destroy() needs
+            // `&mut self` (it replaces `self.compositor`) and `&gl` at once.
+            let state = self.state.take().unwrap();
+            self.apply_pending_compositor(&state.gl);
+            self.state = Some(state);
+        }
+
         let state = self.state.as_mut().unwrap();
         let gl    = &state.gl;
-
-        // Handle pending scale-snap from keyboard hotkey (RCtrl+1 / RCtrl+2).
-        if let Some(snap) = self.scale_snap.lock().take() {
-            let s = match snap { ScaleSnap::Scale1x => 1u32, ScaleSnap::Scale2x => 2u32 };
-            let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
-                width as u32 * s,
-                (height as u32 + STATUS_BAR_HEIGHT as u32) * s,
-            ));
-        }
 
         // Handle window resize — take the latest queued size.
         let (win_w, win_h) = if let Some((w, h)) = self.window_size.lock().take() {
@@ -595,11 +669,15 @@ impl Renderer for GlRenderer {
         // thread's aspect lock sees it when it handles the resulting Resized
         // event (otherwise it would re-fit the window to the stale aspect).
         *self.display_res.lock() = (width as u32, height as u32);
-        // On display resolution change, snap window to 1x of the new resolution.
-        let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
-            width as u32,
-            (height + STATUS_BAR_HEIGHT) as u32,
-        ));
+        // On display resolution change, snap the window to 1x of the new
+        // resolution — but only ever *ask*. This runs on REX3's refresh thread,
+        // and touching the window from here is what used to kill iris on
+        // Windows; see `ResizeRequest` for the full mechanism.
+        *self.resize_request.lock() = Some(ResizeRequest::DisplayMode {
+            w: width as u32,
+            h: (height + STATUS_BAR_HEIGHT) as u32,
+        });
+        let _ = self.event_proxy.send_event(());
     }
 
     fn stop(&mut self) {
@@ -638,21 +716,18 @@ impl Renderer for GlRenderer {
         format!("compositor={} shader=integer+fallback", comp)
     }
 
+    // Called from the monitor/CI socket thread — NOT the context-owning refresh
+    // thread — so it must not touch GL. Record the request; `present()` applies
+    // it. The returned name is what the swap will settle on, which for a Legacy
+    // (GL 2.1) context is always "sw": GlCompositor needs 3.2 core.
     fn switch_compositor(&mut self, use_gl: bool) -> &'static str {
+        let use_gl = use_gl && self.gl_tier == GlTier::Core32;
         if use_gl == self.use_gl_compositor {
+            self.pending_compositor = None;
             return if use_gl { "gl" } else { "sw" };
         }
-        self.use_gl_compositor = use_gl;
-        if let Some(state) = &self.state {
-            self.compositor.destroy(&state.gl);
-        }
-        if use_gl {
-            self.compositor = Box::new(GlCompositor::new());
-            "gl"
-        } else {
-            self.compositor = Box::new(SwCompositor::new());
-            "sw"
-        }
+        self.pending_compositor = Some(use_gl);
+        if use_gl { "gl" } else { "sw" }
     }
 
 }
@@ -670,7 +745,7 @@ pub struct Ui {
     scsi: Arc<Wd33c93a>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
     display_res: Arc<Mutex<(u32, u32)>>,
     timer_manager: Arc<TimerManager>,
     initial_scale: u32,
@@ -744,8 +819,41 @@ impl Ui {
             .expect("failed to create a GL context under any requested version/profile");
         eprintln!("iris: using GL tier {:?}", gl_tier);
 
-        let window_size = Arc::new(Mutex::new(None));
-        let scale_snap  = Arc::new(Mutex::new(None));
+        // Build the window surface and bind the context to it *once, here* — on
+        // the main thread that owns the window, before `Ui::run` starts pumping
+        // messages. This is the one GL step that must not happen lazily on the
+        // refresh thread: `create_window_surface` sets the pixel format (which
+        // makes the Windows GL ICD subclass the window) and the first
+        // `make_current` populates the driver's per-HWND state. Doing that while
+        // the event loop is already delivering a startup resize left the AMD ICD
+        // dereferencing a null pointer inside its wndproc hook (issue #94).
+        // Rendering stays entirely on the refresh thread — only this bind moves.
+        let (not_current_context, initial_surface) = {
+            let sz = window.inner_size();
+            let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                raw_window_handle,
+                NonZeroU32::new(sz.width.max(1)).unwrap(),
+                NonZeroU32::new(sz.height.max(1)).unwrap(),
+            );
+            let surface = unsafe {
+                gl_display
+                    .create_window_surface(&gl_config, &attrs)
+                    .expect("failed to create the GL window surface on the main thread")
+            };
+            let current = not_current_context
+                .make_current(&surface)
+                .expect("failed to make the GL context current during init");
+            // Hand the context straight back to `NotCurrentContext` so the
+            // refresh thread can `make_current` it on its own thread (a GL
+            // context is current on at most one thread at a time).
+            let not_current = current
+                .make_not_current()
+                .expect("failed to release the GL context after init");
+            (not_current, surface)
+        };
+
+        let window_size    = Arc::new(Mutex::new(None));
+        let resize_request = Arc::new(Mutex::new(None));
         // Seed with the Indy's default 1280×1024; the render thread republishes
         // the real resolution on the first frame and on any mode change.
         let display_res = Arc::new(Mutex::new((1280u32, 1024u32)));
@@ -763,14 +871,17 @@ impl Ui {
             window:      window.clone(),
             gl_config,
             not_current_context: Some(not_current_context),
+            initial_surface: Some(initial_surface),
             raw_window_handle,
             gl_tier,
             window_size: window_size.clone(),
-            scale_snap:  scale_snap.clone(),
+            resize_request: resize_request.clone(),
+            event_proxy: event_loop.create_proxy(),
             display_res: display_res.clone(),
             state:       None,
             compositor,
             use_gl_compositor,
+            pending_compositor: None,
             current_w:     0,
             current_h:     0,
             current_win_w: 0,
@@ -779,12 +890,12 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+        Self { ps2, rex3, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
+        let Ui { ps2, rex3, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
         let last_win_size = {
@@ -809,7 +920,7 @@ impl Ui {
 
         event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = UiApp {
-            ps2, rex3, scsi, window, window_size, scale_snap, display_res, mouse_delta,
+            ps2, rex3, scsi, window, window_size, resize_request, display_res, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
             mouse_grabbed: false, rctrl_held: false, last_win_size,
         };
@@ -857,7 +968,8 @@ impl Ui {
         }
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Wd33c93a, scale_snap: &Mutex<Option<ScaleSnap>>,
+    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Arc<Wd33c93a>,
+        resize_request: &Mutex<Option<ResizeRequest>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
     {
         use std::sync::atomic::Ordering;
@@ -880,12 +992,10 @@ impl Ui {
             }
 
             if keycode == KeyCode::F11 && pressed && !input.repeat && *rctrl_held {
-                let new_mode = if window.fullscreen().is_some() {
-                    None
-                } else {
-                    Some(winit::window::Fullscreen::Borderless(None))
-                };
-                window.set_fullscreen(new_mode);
+                // Queued, not applied here: see `ResizeRequest`. Resolving
+                // fullscreen-vs-windowed is deferred to apply time too, so the
+                // toggle reads the state it will actually act on.
+                *resize_request.lock() = Some(ResizeRequest::ToggleFullscreen);
                 return;
             }
 
@@ -895,26 +1005,45 @@ impl Ui {
                 let cdrom_id = scsi.disc_status().first().map(|(id, ..)| *id);
 
                 if let Some(id) = cdrom_id {
-                    // Open file picker (blocks the event loop but winit tolerates it on most platforms)
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Load CD-ROM disc")
-                        .add_filter("ISO images", &["iso", "chd"])
-                        .add_filter("All", &["*"])
-                        .pick_file()
-                    {
-                        let path_str = path.to_string_lossy().into_owned();
-                        match scsi.load_disc(id, path_str.clone()) {
-                            Ok(_) => {
-                                let filename = path.file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path_str.clone());
-                                eprintln!("SCSI #{}: loaded {}", id, filename);
+                    // Run the picker on its own thread rather than inline.
+                    //
+                    // A native file dialog pumps its **own modal message loop**,
+                    // and on Windows that re-enters our window procedure while
+                    // winit is still inside this event callback — the same
+                    // re-entrancy that makes off-thread resizing fatal (see
+                    // `ResizeRequest`), since winit's Windows `EventLoopRunner`
+                    // keeps its handler and buffer in unsynchronised
+                    // `Cell`/`RefCell`. Meanwhile the REX3 thread keeps
+                    // presenting frames and queueing resize requests into that
+                    // same runner.
+                    //
+                    // Off-thread it can neither re-enter the event loop nor
+                    // stall emulation while the dialog sits open.
+                    // `Wd33c93a::load_disc` takes `&self` and locks internally,
+                    // so calling it from here is safe.
+                    let scsi = scsi.clone();
+                    std::thread::Builder::new()
+                        .name("cdrom-picker".to_string())
+                        .spawn(move || {
+                            let Some(path) = rfd::FileDialog::new()
+                                .set_title("Load CD-ROM disc")
+                                .add_filter("ISO images", &["iso", "chd"])
+                                .add_filter("All", &["*"])
+                                .pick_file()
+                            else { return };
+
+                            let path_str = path.to_string_lossy().into_owned();
+                            match scsi.load_disc(id, path_str.clone()) {
+                                Ok(_) => {
+                                    let filename = path.file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path_str.clone());
+                                    eprintln!("SCSI #{}: loaded {}", id, filename);
+                                }
+                                Err(e) => eprintln!("SCSI #{}: {}", id, e),
                             }
-                            Err(e) => {
-                                eprintln!("SCSI #{}: {}", id, e);
-                            }
-                        }
-                    }
+                        })
+                        .expect("failed to spawn cdrom-picker thread");
                 } else {
                     eprintln!("No CD-ROM drive attached");
                 }
@@ -924,12 +1053,16 @@ impl Ui {
             // RCtrl+1 / RCtrl+2: snap window to 1x or 2x scale.
             if pressed && !input.repeat && *rctrl_held {
                 let snap = match keycode {
-                    KeyCode::Digit1 => Some(ScaleSnap::Scale1x),
-                    KeyCode::Digit2 => Some(ScaleSnap::Scale2x),
+                    KeyCode::Digit1 => Some(1u32),
+                    KeyCode::Digit2 => Some(2u32),
                     _ => None,
                 };
                 if let Some(s) = snap {
-                    *scale_snap.lock() = Some(s);
+                    // Recorded rather than applied inline: we are already
+                    // inside a winit event callback, and on Windows resizing
+                    // from in here re-enters the wndproc. `about_to_wait`
+                    // applies it once we're back out of the callback.
+                    *resize_request.lock() = Some(ResizeRequest::Scale(s));
                     return;
                 }
             }
@@ -946,7 +1079,7 @@ struct UiApp {
     scsi:        Arc<Wd33c93a>,
     window:      Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
-    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    resize_request: Arc<Mutex<Option<ResizeRequest>>>,
     display_res: Arc<Mutex<(u32, u32)>>,
     mouse_delta: Arc<Mutex<MouseDelta>>,
     scale: u32,
@@ -967,35 +1100,35 @@ impl ApplicationHandler for UiApp {
             WindowEvent::CloseRequested => { event_loop.exit() },
             WindowEvent::Resized(size) => {
                 if size.width != 0 && size.height != 0 {
-                    let mut new_size = (size.width, size.height);
                     // Lock the window to the display's aspect ratio so the
                     // picture fills it without letterbox bars. Skipped when
                     // fullscreen or maximized (aspect can't be honoured there)
                     // and when disabled by config.
+                    //
+                    // The correction is queued, not applied here: we are inside
+                    // an event callback, and resizing from within one re-enters
+                    // the wndproc on Windows. `about_to_wait` applies it a
+                    // moment later, which also coalesces a burst of Resized
+                    // events (a mouse drag) into a single correction.
                     if self.lock_aspect_ratio
                         && self.window.fullscreen().is_none()
                         && !self.window.is_maximized()
                     {
                         let (dw, dh) = *self.display_res.lock();
-                        if let Some(fixed) = Ui::aspect_fit(
+                        if let Some((w, h)) = Ui::aspect_fit(
                             size.width, size.height, self.last_win_size, dw, dh)
                         {
-                            new_size = match self.window.request_inner_size(
-                                winit::dpi::PhysicalSize::new(fixed.0, fixed.1))
-                            {
-                                // Some => applied synchronously, no further
-                                // Resized event; use the actual granted size.
-                                Some(actual) => (actual.width, actual.height),
-                                None => fixed,
-                            };
+                            *self.resize_request.lock() =
+                                Some(ResizeRequest::DisplayMode { w, h });
                         }
                     }
+                    let new_size = (size.width, size.height);
                     self.last_win_size = new_size;
                     *self.window_size.lock() = Some(new_size);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                Ui::handle_keyboard(&self.ps2, &self.rex3, &self.scsi, &self.scale_snap, event,
+                Ui::handle_keyboard(&self.ps2, &self.rex3, &self.scsi, &self.resize_request, event,
                     &mut self.mouse_grabbed, &mut self.rctrl_held, &self.window);
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1042,6 +1175,66 @@ impl ApplicationHandler for UiApp {
                 // Rendering is driven by the Rex3 refresh thread
             }
             _ => (),
+        }
+    }
+
+    // Wakeup from the render thread's `event_proxy.send_event(())`. The
+    // payload carries no information — the request itself is in
+    // `resize_request`, and `about_to_wait` (which always runs after this)
+    // is what applies it.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {}
+
+    // The one place window-resizing actually happens. Running it here rather
+    // than inside a `window_event` arm matters: winit has finished dispatching
+    // the current batch of OS messages, so `request_inner_size` — which on
+    // Windows synchronously re-enters the wndproc with WM_SIZE — cannot land
+    // in the middle of another event callback. Combined with never calling it
+    // off-thread at all (see `ResizeRequest`), that removes both halves of the
+    // re-entrancy hazard.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some(req) = self.resize_request.lock().take() else { return };
+
+        // Fullscreen is a mode change, not a resize, so it is handled before
+        // the "don't resize while fullscreen" guard below — that guard would
+        // otherwise swallow every request to *leave* fullscreen. The window
+        // manager sends a Resized event of its own afterwards, which
+        // re-establishes window_size/last_win_size, so nothing to publish here.
+        if req == ResizeRequest::ToggleFullscreen {
+            let new_mode = if self.window.fullscreen().is_some() {
+                None
+            } else {
+                Some(winit::window::Fullscreen::Borderless(None))
+            };
+            self.window.set_fullscreen(new_mode);
+            return;
+        }
+
+        // A resize is meaningless while fullscreen or maximized — the window
+        // manager owns the size — and applying one would fight it.
+        if self.window.fullscreen().is_some() || self.window.is_maximized() {
+            return;
+        }
+
+        let (w, h) = match req {
+            ResizeRequest::DisplayMode { w, h } => (w, h),
+            ResizeRequest::Scale(s) => {
+                let (dw, dh) = *self.display_res.lock();
+                if dw == 0 || dh == 0 { return; }
+                (dw * s, (dh + STATUS_BAR_HEIGHT as u32) * s)
+            }
+            // Handled above; listed so a new variant is a compile error here.
+            ResizeRequest::ToggleFullscreen => return,
+        };
+        if w == 0 || h == 0 { return; }
+
+        let size = winit::dpi::PhysicalSize::new(w, h);
+        if let Some(actual) = self.window.request_inner_size(size) {
+            // Applied synchronously: no Resized event will follow, so publish
+            // the new size ourselves or the renderer keeps the stale one.
+            if actual.width != 0 && actual.height != 0 {
+                self.last_win_size = (actual.width, actual.height);
+                *self.window_size.lock() = Some((actual.width, actual.height));
+            }
         }
     }
 
