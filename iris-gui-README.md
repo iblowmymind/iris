@@ -138,14 +138,20 @@ launch (open/closed state isn't persisted).
 
 ### Scaling
 
-**View → Emulator scale** sets how large the guest's display is drawn, in
-logical points per emulated pixel — `1×` is the guest's own resolution, which
-is one device pixel on a standard screen and a crisp 2×2 block on a Retina one.
-The window is resized to hold exactly that, as far as the screen's usable area
-allows, and the picture is drawn at a whole number of device pixels and snapped
-to the pixel grid, so nothing is smoothed or dropped. Only when the framebuffer
-is larger than the space available is it scaled down (and then filtered); the
-title says which you are getting.
+In **View → Graphics scaling**, choose one of two modes:
+
+- **Nearest integer** (default): centers the display at the largest whole
+  device-pixel scale that fits, with black space around it. If the window is
+  smaller than the framebuffer at 1×, it scales down with filtering.
+- **Stretch**: fills the window using linear filtering. Enable **Keep aspect
+  ratio** to fit the largest undistorted picture, with black space around it.
+
+Both options apply to windowed and fullscreen display and persist across launches.
+With two display heads, each head scales within its half of the window.
+
+**View → Emulator scale** resizes the window to a requested size in logical
+points per emulated pixel. This is separate from the graphics scaling mode.
+On Retina displays, one logical point typically spans two device pixels.
 
 The **Video-In** tab's source selector offers:
 

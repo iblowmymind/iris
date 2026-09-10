@@ -80,14 +80,6 @@ fn abs_path(p: &str) -> String {
         .unwrap_or_else(|_| p.to_string())
 }
 
-/// True when `scale` (device pixels per emulated pixel) is close enough to a
-/// positive integer that nearest-neighbour sampling stays pixel-perfect. Off
-/// an integer, bilinear filtering avoids uneven pixel doubling.
-fn is_integer_scale(scale: f32) -> bool {
-    let rounded = scale.round();
-    rounded >= 1.0 && (scale - rounded).abs() <= 0.01
-}
-
 /// Device pixels per emulated pixel to draw a `fb_px` framebuffer into `avail`
 /// points at `ppp` device pixels per point, plus whether that scale is
 /// pixel-exact (so NEAREST sampling is safe).
@@ -123,6 +115,21 @@ fn fb_device_scale(avail: egui::Vec2, fb_px: egui::Vec2, ppp: f32) -> (f32, bool
     }
 }
 
+/// Compute the draw size and sampler together so resizing cannot leave a
+/// stale nearest sampler on a fractionally stretched image.
+fn display_size(avail: egui::Vec2, px: egui::Vec2, ppp: f32,
+                mode: settings::DisplayScaling, keep_aspect: bool) -> (egui::Vec2, bool) {
+    match mode {
+        settings::DisplayScaling::NearestInteger => {
+            let (scale, nearest) = fb_device_scale(avail, px, ppp);
+            (px * (scale / ppp), nearest)
+        }
+        settings::DisplayScaling::Stretch => {
+            (if keep_aspect { fb_fit_size(avail, px) } else { avail }, false)
+        }
+    }
+}
+
 /// Snap `rect` to the device-pixel grid. An image whose edges sit on a fraction
 /// of a device pixel is sampled across pixel boundaries, so even at an exact
 /// integer scale NEAREST drops or doubles whole rows and columns.
@@ -146,6 +153,7 @@ fn requested_device_scale(vm_scale: f32, native_ppp: f32) -> f32 {
 }
 
 fn main() -> eframe::Result<()> {
+    iris::crash_diag::install();
     env_logger::init();
     // Prevent the iris lib from calling process::exit on guest soft-power-off
     // or CI `quit`. iris-gui never wants the embedder to die from a guest event.
@@ -1466,61 +1474,52 @@ impl App {
         self.framebuffer_panel_single(ui);
     }
 
-    /// Dual Newport heads: side-by-side viewports (head 0 captures input).
+    /// Dual Newport heads share the scaling policy and capture input.
     fn framebuffer_panel_dual(&mut self, ui: &mut egui::Ui) {
-        let seq0 = self.emu.frame_sink.seq();
-        let seq1 = self.emu.frame_sink_head1.seq();
-        if seq0 == 0 && seq1 == 0 {
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Emulator running — waiting for first REX3 frame…")
-                    .color(Color32::LIGHT_GRAY));
-            });
-            return;
+        let mode = self.prefs.display_scaling;
+        let keep_aspect = self.prefs.keep_aspect_ratio;
+        let outer = ui.available_rect_before_wrap();
+        let ppp = ui.ctx().pixels_per_point();
+        if self.pending_fb_snap {
+            if let Some(tex) = &self.fb_tex {
+                Self::snap_window_to_fb(ui.ctx(), tex.size_vec2() * egui::vec2(2.0, 1.0),
+                    outer.size(), self.prefs.vm_scale);
+                self.pending_fb_snap = false;
+            }
         }
-        ui.columns(2, |cols| {
-            cols[0].vertical(|ui| {
-                ui.label(RichText::new("Head 0").small().weak());
-                if seq0 > 0 {
-                    Self::upload_fb_texture(ui, &self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb");
-                    if let Some(tex) = &self.fb_tex {
-                        let size = fb_fit_size(ui.available_size(), tex.size_vec2());
-                        ui.centered_and_justified(|ui| {
-                            let response = ui.add(
-                                egui::Image::new((tex.id(), size))
-                                    .fit_to_exact_size(size)
-                                    .sense(egui::Sense::click()),
-                            );
-                            if response.clicked() {
-                                response.request_focus();
-                                self.input_state.captured = true;
-                            }
-                        });
-                    }
+        let mut clicked = false;
+        for head in 0..2 {
+            let left = outer.left() + outer.width() * head as f32 / 2.0;
+            let area = egui::Rect::from_min_size(
+                egui::pos2(left, outer.top()), egui::vec2(outer.width() / 2.0, outer.height()));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                let (sink, tex, seq, id) = if head == 0 {
+                    (&self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb")
                 } else {
-                    ui.label(RichText::new("waiting…").weak());
+                    (&self.emu.frame_sink_head1, &mut self.fb_tex_head1, &mut self.last_fb_seq_head1, "rex3_fb_h1")
+                };
+                Self::upload_fb_texture(ui, sink, tex, seq, id, mode, keep_aspect);
+                if let Some(tex) = tex {
+                    let (size, nearest) = display_size(area.size(), tex.size_vec2(), ppp, mode, keep_aspect);
+                    let rect = snap_rect_to_pixels(egui::Rect::from_center_size(area.center(), size), ppp);
+                    ui.painter().image(tex.id(), rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    let response = ui.interact(rect, ui.id().with(id), egui::Sense::click());
+                    if response.clicked() { response.request_focus(); clicked = true; }
+                    if head == 0 && self.input_state.captured {
+                        response.request_focus();
+                        ui.memory_mut(|m| m.set_focus_lock_filter(response.id, egui::EventFilter {
+                            tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true,
+                        }));
+                    }
+                    if head == 0 {
+                        self.fb_nearest = nearest;
+                        self.fb_scale = size.y * ui.ctx().zoom_factor() / tex.size_vec2().y;
+                    }
                 }
             });
-            cols[1].vertical(|ui| {
-                ui.label(RichText::new("Head 1").small().weak());
-                if seq1 > 0 {
-                    Self::upload_fb_texture(
-                        ui,
-                        &self.emu.frame_sink_head1,
-                        &mut self.fb_tex_head1,
-                        &mut self.last_fb_seq_head1,
-                        "rex3_fb_h1",
-                    );
-                    if let Some(tex) = &self.fb_tex_head1 {
-                        let size = fb_fit_size(ui.available_size(), tex.size_vec2());
-                        ui.centered_and_justified(|ui| {
-                            ui.add(egui::Image::new((tex.id(), size)).fit_to_exact_size(size));
-                        });
-                    }
-                } else {
-                    ui.label(RichText::new("waiting…").weak());
-                }
-            });
-        });
+        }
+        self.framebuffer_input(ui, clicked);
     }
 
     fn upload_fb_texture(
@@ -1529,24 +1528,21 @@ impl App {
         tex_slot: &mut Option<egui::TextureHandle>,
         last_seq: &mut u64,
         tex_id: &str,
+        mode: settings::DisplayScaling,
+        keep_aspect: bool,
     ) {
         let seq = sink.seq();
         if seq == 0 { return; }
-        let want_nearest = match tex_slot.as_ref().map(|t| t.size_vec2()) {
-            Some(px) if px.x >= 1.0 && px.y >= 1.0 => {
-                let scale = ui.available_size().y * ui.ctx().pixels_per_point() / px.y;
-                is_integer_scale(scale)
-            }
-            _ => true,
-        };
-        if tex_slot.is_none() || seq != *last_seq {
+        let want_nearest = tex_slot.as_ref().map(|tex| {
+            display_size(ui.available_size(), tex.size_vec2(), ui.ctx().pixels_per_point(), mode, keep_aspect).1
+        }).unwrap_or(mode == settings::DisplayScaling::NearestInteger);
+        let opts = if want_nearest { egui::TextureOptions::NEAREST } else { egui::TextureOptions::LINEAR };
+        if tex_slot.is_none() || seq != *last_seq || tex_slot.as_ref().is_some_and(|t| ui.ctx().tex_manager().read().meta(t.id()).is_some_and(|m| m.options != opts)) {
             let frame = sink.snapshot();
             if frame.width == 0 || frame.height == 0 { return; }
-            let opts = if want_nearest {
-                egui::TextureOptions::NEAREST
-            } else {
-                egui::TextureOptions::LINEAR
-            };
+            let (_, nearest) = display_size(ui.available_size(),
+                egui::vec2(frame.width as f32, frame.height as f32), ui.ctx().pixels_per_point(), mode, keep_aspect);
+            let opts = if nearest { egui::TextureOptions::NEAREST } else { egui::TextureOptions::LINEAR };
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width, frame.height],
                 &frame.rgba,
@@ -1587,14 +1583,17 @@ impl App {
         let zoom = ui.ctx().zoom_factor();
         let ppp = ui.ctx().pixels_per_point();
         let want_nearest = match self.fb_tex.as_ref().map(|t| t.size_vec2()) {
-            Some(px) if px.x >= 1.0 && px.y >= 1.0 => fb_device_scale(avail, px, ppp).1,
-            _ => true,
+            Some(px) if px.x >= 1.0 && px.y >= 1.0 => display_size(avail, px, ppp, self.prefs.display_scaling, self.prefs.keep_aspect_ratio).1,
+            _ => self.prefs.display_scaling == settings::DisplayScaling::NearestInteger,
         };
 
         if self.fb_tex.is_none() || seq != self.last_fb_seq || want_nearest != self.fb_nearest {
             let frame = self.emu.frame_sink.snapshot();
             if frame.width == 0 || frame.height == 0 { return; }
 
+            let (_, want_nearest) = display_size(avail,
+                egui::vec2(frame.width as f32, frame.height as f32), ppp,
+                self.prefs.display_scaling, self.prefs.keep_aspect_ratio);
             let opts = if want_nearest {
                 egui::TextureOptions::NEAREST
             } else {
@@ -1603,7 +1602,7 @@ impl App {
 
             let partial = frame.dirty_h > 0
                 && frame.dirty_h < frame.height as u32
-                && self.fb_tex.is_some();
+                && self.fb_tex.as_ref().is_some_and(|t| t.size() == [frame.width, frame.height]);
 
             if partial {
                 let y = frame.dirty_y as usize;
@@ -1648,16 +1647,9 @@ impl App {
             if do_snap {
                 Self::snap_window_to_fb(ui.ctx(), tex_size, avail, self.prefs.vm_scale);
             }
-            // Largest pixel-exact size that fits (aspect-preserved). The window
-            // — not the image — carries the chosen scale (set by the snap
-            // above), so the steady-state draw is stable: no per-frame resize,
-            // no jitter. Snapping the rect to the device-pixel grid matters as
-            // much as the scale itself: an image whose edges land on a fraction
-            // of a device pixel is sampled across pixel boundaries, and NEAREST
-            // then drops or doubles whole rows and columns even at an exact
-            // integer scale.
-            let (dev_scale, _) = fb_device_scale(avail, tex_size, ppp);
-            let size = tex_size * (dev_scale / ppp);
+            // Both modes share the centered, device-pixel-aligned draw path.
+            let (size, _) = display_size(avail, tex_size, ppp,
+                self.prefs.display_scaling, self.prefs.keep_aspect_ratio);
             // Reported VM scale: logical points per emulated pixel relative to
             // native backing (1.0 = native). `size` is in zoom-scaled points, so
             // multiply by zoom to recover the zoom-independent figure.
@@ -1726,7 +1718,10 @@ impl App {
             }
         }
         self.fb_scale = new_fb_scale;
+        self.framebuffer_input(ui, fb_clicked);
+    }
 
+    fn framebuffer_input(&mut self, ui: &egui::Ui, fb_clicked: bool) {
         // When the guest becomes "safe to stop" (CPU halted — a clean IRIX
         // shutdown / `halt`), auto-release the captured mouse & keyboard so the
         // user gets their cursor back without pressing Ctrl+Alt+Esc. Edge-
@@ -3237,5 +3232,53 @@ mod preflight_tests {
     extern "C" {
         #[link_name = "geteuid"]
         fn libc_geteuid() -> u32;
+    }
+}
+
+#[cfg(test)]
+mod display_scaling_tests {
+    use super::*;
+    use settings::DisplayScaling::{NearestInteger, Stretch};
+
+    #[test]
+    fn modes_fit_a_widescreen_window() {
+        let available = egui::vec2(1920.0, 1080.0);
+        let source = egui::vec2(1280.0, 1024.0);
+        assert_eq!(display_size(available, source, 1.0, NearestInteger, false), (source, true));
+        assert_eq!(display_size(available, source, 1.0, Stretch, false), (available, false));
+        assert_eq!(display_size(available, source, 1.0, Stretch, true), (egui::vec2(1350.0, 1080.0), false));
+    }
+
+    #[test]
+    fn portrait_and_small_windows_preserve_aspect_when_requested() {
+        let source = egui::vec2(1280.0, 1024.0);
+        for available in [egui::vec2(800.0, 1200.0), egui::vec2(640.0, 400.0)] {
+            let (size, nearest) = display_size(available, source, 1.0, Stretch, true);
+            assert!(!nearest);
+            assert!(size.x <= available.x && size.y <= available.y);
+            assert!((size.x / size.y - 1.25).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn retina_integer_scaling_uses_device_pixels_and_aligned_edges() {
+        let source = egui::vec2(1280.0, 1024.0);
+        let (size, nearest) = display_size(egui::vec2(1920.0, 1080.0), source, 2.0, NearestInteger, true);
+        assert_eq!(size, source);
+        assert!(nearest);
+        let rect = snap_rect_to_pixels(egui::Rect::from_center_size(egui::pos2(960.25, 540.25), size), 2.0);
+        assert_eq!(rect.min.x * 2.0, (rect.min.x * 2.0).round());
+        assert_eq!(rect.size() * 2.0, source * 2.0);
+    }
+
+    #[test]
+    fn old_preferences_keep_integer_mode_and_new_choices_round_trip() {
+        let mut prefs: GuiSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.display_scaling, NearestInteger);
+        prefs.display_scaling = Stretch;
+        prefs.keep_aspect_ratio = true;
+        let loaded: GuiSettings = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(loaded.display_scaling, Stretch);
+        assert!(loaded.keep_aspect_ratio);
     }
 }

@@ -54,3 +54,15 @@ Gotchas worth keeping in mind here:
   `fb_device_scale` accepts the next step up when it overhangs by ≤1 device
   pixel — without that, being 0.2 px short knocks 2× down to 1× and halves the
   picture.
+
+## Scaling modes
+
+`display_size` returns both the destination size and the texture-filter choice.
+Both display heads and the single-display path use it. Nearest integer preserves
+integer device-pixel scaling; Stretch uses linear filtering and can optionally
+preserve aspect ratio. Draw rectangles remain centered and aligned to device
+pixels, and the running central panel stays black in both modes.
+
+A mode change or resize can change the required texture filter even when the
+frame sequence has not advanced. Update the sampler in that case too; otherwise
+a frozen guest can retain nearest sampling while stretched to a fractional size.

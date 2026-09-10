@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayScaling {
+    #[default]
+    NearestInteger,
+    Stretch,
+}
+
 /// GUI-only persisted state. Lives at `~/.config/iris/gui.json`.
 ///
 /// This is the **system of record** for machines: each named machine is a
@@ -19,6 +27,10 @@ pub struct GuiSettings {
     /// resize the picture, and vice-versa.
     #[serde(default = "default_vm_scale")]
     pub vm_scale: f32,
+    #[serde(default)]
+    pub display_scaling: DisplayScaling,
+    #[serde(default)]
+    pub keep_aspect_ratio: bool,
 
     /// All saved machines keyed by user-visible name. BTreeMap so menus
     /// list them in stable alphabetical order.

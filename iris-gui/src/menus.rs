@@ -9,7 +9,6 @@
 //! on. Adding a menu item means touching the builder and the dispatcher, and
 //! nothing platform-specific.
 
-use crate::config_ui::Tab;
 use crate::settings;
 use crate::App;
 use eframe::egui;
@@ -61,9 +60,10 @@ pub enum Action {
     // --- View ---
     ToggleFullscreen,
     SetVmScale(f32),
+    SetDisplayScaling(settings::DisplayScaling),
+    ToggleAspectRatio,
     SetUiScale(f32),
     ShowConfig,
-    ConfigTab(Tab),
 
     // --- Help ---
     NetCheck,
@@ -227,12 +227,14 @@ impl App {
         items.push(act("Rename current\u{2026}", Action::RenameMachine).enabled_if(has_active));
         items.push(act("Delete current machine", Action::DeleteMachine).enabled_if(has_active));
 
+        items.push(Item::Separator);
+        items.push(act("Configuration\u{2026}", Action::ShowConfig).accel(','));
+
         // iris.toml import/export is a source-build affordance for users who
         // also run the standalone `iris` CLI; the GUI's own gui.json machine
         // store is the system of record. Hidden in pre-compiled / App Store
         // builds (the `bundled` feature). See iris-gui Cargo.toml.
         if !cfg!(feature = "bundled") {
-            items.push(Item::Separator);
             items.push(act("Import iris.toml\u{2026}", Action::ImportToml));
             items.push(act("Export current to iris.toml\u{2026}", Action::ExportToml));
             items.push(act("Prepare for premiere\u{2026}", Action::PrepareForPremiere));
@@ -486,6 +488,21 @@ impl App {
             Item::Separator,
         ];
 
+        use settings::DisplayScaling;
+        items.push(Item::Sub {
+            label: "Graphics scaling".into(),
+            items: vec![
+                act("Nearest integer", Action::SetDisplayScaling(DisplayScaling::NearestInteger))
+                    .checked_if(self.prefs.display_scaling == DisplayScaling::NearestInteger),
+                act("Stretch", Action::SetDisplayScaling(DisplayScaling::Stretch))
+                    .checked_if(self.prefs.display_scaling == DisplayScaling::Stretch),
+                Item::Separator,
+                act("Keep aspect ratio", Action::ToggleAspectRatio)
+                    .checked_if(self.prefs.keep_aspect_ratio)
+                    .enabled_if(self.prefs.display_scaling == DisplayScaling::Stretch),
+            ],
+        });
+
         // The emulated display is drawn at a whole number of device pixels per
         // emulated pixel wherever it can be, so these are exact: 1× is the
         // guest's own resolution, one emulated pixel per logical point.
@@ -517,14 +534,6 @@ impl App {
             items: ui_steps,
         });
 
-        items.push(Item::Separator);
-        items.push(act("Configuration\u{2026}", Action::ShowConfig).accel(','));
-        let mut tabs: Vec<Item> = Tab::visible()
-            .into_iter()
-            .map(|t| act(t.label(), Action::ConfigTab(t)).checked_if(self.tab == t))
-            .collect();
-        tabs.insert(0, Item::Info("Open the configuration window at:".into()));
-        items.push(Item::Sub { label: "Configuration tab".into(), items: tabs });
         Menu { title: "View".into(), items }
     }
 
@@ -766,6 +775,16 @@ impl App {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
             }
+            Action::SetDisplayScaling(mode) => {
+                self.prefs.display_scaling = mode;
+                let _ = self.prefs.save();
+                ctx.request_repaint();
+            }
+            Action::ToggleAspectRatio => {
+                self.prefs.keep_aspect_ratio = !self.prefs.keep_aspect_ratio;
+                let _ = self.prefs.save();
+                ctx.request_repaint();
+            }
             Action::SetVmScale(s) => {
                 self.prefs.vm_scale = s;
                 self.pending_fb_snap = true;
@@ -780,10 +799,6 @@ impl App {
                 let _ = self.prefs.save();
             }
             Action::ShowConfig => self.show_config_editor = true,
-            Action::ConfigTab(t) => {
-                self.tab = t;
-                self.show_config_editor = true;
-            }
 
             // --- Help ---
             Action::NetCheck => self.show_net_check = true,
