@@ -1,0 +1,62 @@
+# Codex Instructions — IRIS
+
+IRIS is an SGI Indy (MIPS R4400) emulator written in Rust. It boots IRIX 6.5
+and 5.3 to a usable system (shell, networking, X11). It is **not** cycle-accurate
+— IRIX doesn't need it and accuracy would only make it slower.
+
+## Read these first
+
+- `HACKING.md` — architecture: data path/endianness, concurrency model, the
+  MC bus/device/port abstraction. **Read before touching device or CPU code.**
+- `HELP.md` — running it: serial ports, monitor console, NVRAM/MAC setup, disk
+  image prep.
+- `README.md` — overview, feature flags, current status.
+- `docs/` — per-device notes (hal2, rex3, irix-install, …).
+- `rules/` — accumulated, hard-won findings about emulator behaviour
+  (`jitv2/`, `snapshot/`, `irix/`, `testing/`). Check here before re-deriving a
+  gotcha; when you confirm a non-obvious fix, write it up here as a short
+  markdown note so the next session doesn't relearn it.
+
+## Build & run
+
+```
+cargo run --release                                       # interpreter
+cargo run --release --features lightning,rex-jit          # recommended for speed
+cargo run --release --features jitv2,rex-jit              # enable MIPS JIT v2 (experimental)
+```
+
+Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
+`iris-bench` (benchmark driver), `coffdump`, `chd_extract`. Feature flags are
+documented in `README.md`.
+
+## Testing and benchmarking
+
+- `cpu-tests/` — bare-metal MIPS III/IV correctness suite. "Is this instruction
+  right", one instruction at a time. `make -C cpu-tests run`.
+- `bench/` — bare-metal benchmark suite. "How fast is this build, and is it
+  still right after ten million of them." Reports throughput, guest MIPS and an
+  accuracy score per kernel; `iris-bench matrix` sweeps R4400/R5000 x
+  interpreter/jitv2. Read `rules/testing/benchmark-suite-gotchas.md` before
+  adding a kernel — the accuracy check catches endianness, uninitialised
+  memory and out-of-bounds reads, and every one of those has already happened.
+- Both share `cpu-tests/harness` (toolchain probe, SCC console, startup and
+  exception dispatch). Changing those files affects both suites.
+
+## Hard invariants (from HACKING.md)
+
+- **Endianness lives only at "The Edge."** Host `u32`/`u64` are bit-containers;
+  byte-swapping happens at PROM/disk I/O via `swap_on_load`, never in CPU/bus/MC
+  logic. **Do not suggest `.to_be()` / `.to_le()` for memory or register code.**
+- **Concurrency is per-device.** CPU, REX3, SCSI, and ethernet run on their own
+  threads and lock their own state. Deadlocks live in callbacks *up* to a parent
+  device (e.g. SCSI → HPC3) — be careful there.
+
+## Automation & CI
+
+- `iris-ci` is the canonical socket interface for driving a running emulator
+  (snapshots, scripted input, headless runs). Prefer it over ad-hoc serial
+  poking. See `rules/snapshot/` and `manual_test_runbook.md`.
+- Install IRIX only from original media (see `docs/irix-install.md`). Never use a
+  pre-built MAME CHD as a shortcut.
+- After changing PROM env (`setenv`/`unsetenv`) or NVRAM, run `rtc save` from the
+  monitor console before halting, or the change is lost.
