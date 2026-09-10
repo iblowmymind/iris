@@ -70,6 +70,15 @@ define_class!(
 /// hold an unretained pointer to their target).
 static TARGET: Mutex<Option<Retained<MenuTarget>>> = Mutex::new(None);
 
+/// Keep tool windows separate from the emulator, including in fullscreen.
+/// AppKit otherwise groups a newly opened configuration window into the
+/// fullscreen window's tab group, replacing its requested content size.
+pub fn disable_automatic_window_tabbing() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        objc2_app_kit::NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
+    }
+}
+
 /// Remember the egui context so a menu click can request a repaint.
 pub fn install(ctx: &eframe::egui::Context) {
     let _ = CTX.set(ctx.clone());

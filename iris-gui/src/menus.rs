@@ -772,8 +772,7 @@ impl App {
 
             // --- View ---
             Action::ToggleFullscreen => {
-                self.fullscreen = !self.fullscreen;
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+                self.toggle_fullscreen(ctx);
             }
             Action::SetDisplayScaling(mode) => {
                 self.prefs.display_scaling = mode;

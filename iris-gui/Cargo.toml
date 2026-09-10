@@ -134,7 +134,7 @@ objc2-foundation = { version = "0.3", features = [
 # window to itself while a machine runs.
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder",
-    "NSScreen",
+    "NSScreen", "NSWindow",
 ] }
 
 [[bin]]

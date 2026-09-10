@@ -155,6 +155,8 @@ fn requested_device_scale(vm_scale: f32, native_ppp: f32) -> f32 {
 fn main() -> eframe::Result<()> {
     iris::crash_diag::install();
     env_logger::init();
+    #[cfg(target_os = "macos")]
+    macos_menu::disable_automatic_window_tabbing();
     // Prevent the iris lib from calling process::exit on guest soft-power-off
     // or CI `quit`. iris-gui never wants the embedder to die from a guest event.
     // Set this once, before any worker thread can read it.
@@ -1206,6 +1208,12 @@ impl App {
         if !open {
             self.show_net_check = false;
         }
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !ctx.input(|i| i.viewport().fullscreen).unwrap_or(self.fullscreen);
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, ViewportCommand::Fullscreen(self.fullscreen));
+        self.menus_built = std::time::Instant::now() - std::time::Duration::from_secs(1);
     }
 
     /// Rebuild the menu description if it may have gone stale, and hand it to
@@ -2588,6 +2596,14 @@ impl eframe::App for App {
     // egui 0.35 replaced `App::update(ctx)` with `App::ui(ui)`; panels now attach to a `Ui`.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        // Native green-button and Escape transitions do not pass through our
+        // menu actions. Use the root viewport's reported state as the authority.
+        if let Some(fullscreen) = ctx.input(|i| i.viewport().fullscreen) {
+            if self.fullscreen != fullscreen {
+                self.fullscreen = fullscreen;
+                self.menus_built = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            }
+        }
         self.handle_events(ctx);
         self.maybe_autosave();
 
@@ -2613,8 +2629,7 @@ impl eframe::App for App {
         // reaches IRIX because this toggle eats it). input::pump forwards that
         // chord to the guest while captured.
         if ctx.input(|i| i.key_pressed(egui::Key::F11) && !(i.modifiers.ctrl && i.modifiers.alt)) {
-            self.fullscreen = !self.fullscreen;
-            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+            self.toggle_fullscreen(ctx);
         }
 
         // Ctrl+F12 opens a file picker to load a CD-ROM disc on the fly (hot-swap)
