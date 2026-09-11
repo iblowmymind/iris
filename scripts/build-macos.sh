@@ -11,6 +11,7 @@
 #   ./scripts/build-macos.sh lightning        # enable iris/lightning feature
 #   ./scripts/build-macos.sh appstore         # SANDBOXED build (App Store parity)
 #   ./scripts/build-macos.sh lightning pcap   # ...plus bridged networking
+#   ./scripts/build-macos.sh lightning pcap jitv2 # ...plus experimental MIPS JIT v2
 #
 # `pcap` adds bridged (PCAP) networking, which puts the guest on your real LAN
 # as its own L2 host instead of behind the built-in NAT gateway. Without it the
@@ -37,13 +38,15 @@ set -e
 # Options are order-independent: one variant, plus any number of add-ons.
 VARIANT="standard"
 WANT_PCAP=0
+WANT_JITV2=0
 for arg in "$@"; do
     case "$arg" in
         standard|lightning|appstore|sandbox) VARIANT="$arg" ;;
         pcap) WANT_PCAP=1 ;;
+        jitv2) WANT_JITV2=1 ;;
         *)
             echo "unknown option: $arg" >&2
-            echo "usage: $0 [standard|lightning|appstore] [pcap]" >&2
+            echo "usage: $0 [standard|lightning|appstore] [pcap] [jitv2]" >&2
             exit 1
             ;;
     esac
@@ -61,6 +64,13 @@ fi
 if [ "$WANT_PCAP" = 1 ] && [ "$SANDBOXED" = 1 ]; then
     echo "error: pcap and the sandboxed ($VARIANT) variant are incompatible." >&2
     echo "       The App Store build has no bridged networking by design." >&2
+    exit 1
+fi
+
+# The sandboxed app forces interpreter-only execution.
+if [ "$WANT_JITV2" = 1 ] && [ "$SANDBOXED" = 1 ]; then
+    echo "error: jitv2 and the sandboxed ($VARIANT) variant are incompatible." >&2
+    echo "       The App Store build disables JIT execution." >&2
     exit 1
 fi
 
@@ -108,6 +118,7 @@ case "$VARIANT" in
         ;;
 esac
 [ "$WANT_PCAP" = 1 ] && add_feature "pcap"
+[ "$WANT_JITV2" = 1 ] && add_feature "iris/jitv2"
 
 echo "  Features: ${FEATURES:-(default)}"
 if [ -n "$FEATURES" ]; then

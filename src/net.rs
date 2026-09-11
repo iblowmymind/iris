@@ -58,7 +58,8 @@ pub struct GatewayConfig {
     pub gateway_ip:  Ipv4Addr,
     pub client_ip:   Ipv4Addr,
     pub netmask:     Ipv4Addr,
-    pub dns_upstream: SocketAddr,
+    /// Explicit DNS override; None uses the macOS system resolver.
+    pub dns_upstream: Option<SocketAddr>,
     /// NFS configuration; if Some, portmap and NAT redirection for NFS/mountd are enabled.
     pub nfs: Option<NfsConfig>,
     /// Port forwarding rules: host listens and forwards to the guest.
@@ -83,7 +84,9 @@ impl Default for GatewayConfig {
             gateway_ip:   subnet.gateway_ip,
             client_ip:    subnet.client_ip,
             netmask:      subnet.netmask,
-            dns_upstream: "8.8.8.8:53".parse().unwrap(),
+            dns_upstream: if cfg!(target_os = "macos") { None } else {
+                Some("8.8.8.8:53".parse().unwrap())
+            },
             nfs:          None,
             port_forwards: vec![],
             mode:         NetMode::Nat,
@@ -1136,6 +1139,7 @@ mod nfs_pcap_tests {
 // ── NAT engine ────────────────────────────────────────────────────────────────
 pub struct NatEngine {
     config:  GatewayConfig,
+    dns: Option<crate::net_dns::DnsProxy>,
     tx_cons: rtrb::Consumer<Vec<u8>>, // outbound frames from enet thread
     rx_prod: rtrb::Producer<Vec<u8>>, // inbound frames to enet thread
     rx_wake: Arc<(Mutex<()>, Condvar)>, // signal enet thread when rx_prod gets a frame
@@ -1273,7 +1277,7 @@ impl NatEngine {
             eprintln!("iris: TFTP server (read-only) serving {}", dir.display());
             crate::tftp::TftpServer::new(dir.clone())
         });
-        Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
+        Self { config, dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
@@ -1374,6 +1378,7 @@ impl NatEngine {
                 self.process(&frame);
             }
 
+            self.poll_dns();
             self.poll_udp();
             self.poll_tcp();
             self.poll_icmp();
@@ -1761,7 +1766,7 @@ impl NatEngine {
 
         match dport {
             UDP_PORT_BOOTP_SERVER => self.handle_bootp(src_mac, sport, payload),
-            UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
+            UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, dst_ip, sport, payload),
             UDP_PORT_PORTMAP if self.config.nfs.is_some()
                               => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
             NFS_VM_PORT | MOUNTD_VM_PORT if self.nfs.is_some() && dst_ip == self.config.gateway_ip
@@ -1871,12 +1876,8 @@ impl NatEngine {
             rep[o+2..o+6].copy_from_slice(&self.config.netmask.octets()); o+=6;
             rep[o]=3; rep[o+1]=4;
             rep[o+2..o+6].copy_from_slice(&self.config.gateway_ip.octets()); o+=6;
-            let dns_ip = match self.config.dns_upstream.ip() {
-                IpAddr::V4(ip) => ip,
-                _              => Ipv4Addr::new(8,8,8,8),
-            };
             rep[o]=6; rep[o+1]=4;
-            rep[o+2..o+6].copy_from_slice(&dns_ip.octets()); o+=6;
+            rep[o+2..o+6].copy_from_slice(&self.config.gateway_ip.octets()); o+=6;
             rep[o]=51; rep[o+1]=4; w32(&mut rep, o+2, 86400); o+=6;
             rep[o]=54; rep[o+1]=4;
             rep[o+2..o+6].copy_from_slice(&self.config.gateway_ip.octets()); o+=6;
@@ -1892,17 +1893,29 @@ impl NatEngine {
     }
 
     // ── DNS forwarding ────────────────────────────────────────────────────────
-    fn forward_dns(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr, client_port: u16, query: &[u8]) {
-        dlog_dev!(LogModule::Net, "NAT DNS forward len={}", query.len());
-        let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return; };
-        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-        if sock.send_to(query, self.config.dns_upstream).is_err() { return; }
-        let mut buf = [0u8; 512];
-        if let Ok((n, _)) = sock.recv_from(&mut buf) {
-            let udp = udp_packet(self.config.gateway_ip, client_ip,
-                                 UDP_PORT_DNS, client_port, &buf[..n]);
-            let frame = ip_frame(client_mac, &self.config.gateway_mac,
-                                 self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+    fn forward_dns(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr, server_ip: Ipv4Addr, client_port: u16, query: &[u8]) {
+        if self.dns.is_none() {
+            match crate::net_dns::DnsProxy::new(self.config.dns_upstream) {
+                Ok(proxy) => self.dns = Some(proxy),
+                Err(err) => {
+                    dlog_dev!(LogModule::Net, "NAT DNS worker: {}", err);
+                    return;
+                }
+            }
+        }
+        self.dns.as_ref().unwrap().submit(crate::net_dns::Request {
+            client_mac: *client_mac, client_ip, server_ip, client_port,
+            query: query.to_vec(),
+        });
+    }
+
+    fn poll_dns(&mut self) {
+        while let Some((request, reply)) = self.dns.as_ref().and_then(|dns| dns.poll()) {
+            // Reply from the address queried, including manually configured guest DNS.
+            let udp = udp_packet(request.server_ip, request.client_ip,
+                                 UDP_PORT_DNS, request.client_port, &reply);
+            let frame = ip_frame(&request.client_mac, &self.config.gateway_mac,
+                                 request.server_ip, request.client_ip, IP_PROTO_UDP, &udp);
             self.enqueue_rx(frame);
         }
     }
@@ -2689,5 +2702,71 @@ impl NetBackend for NatEngine {
     fn run(&mut self) {
         // Delegate to the inherent run loop.
         NatEngine::run(self)
+    }
+}
+
+#[cfg(test)]
+mod dns_nat_tests {
+    use super::*;
+
+    fn engine(upstream: SocketAddr) -> (NatEngine, rtrb::Consumer<Vec<u8>>) {
+        let (_, tx_cons) = rtrb::RingBuffer::new(8);
+        let (rx_prod, rx_cons) = rtrb::RingBuffer::new(8);
+        let engine = NatEngine::new(
+            GatewayConfig { dns_upstream: Some(upstream), ..GatewayConfig::default() },
+            tx_cons, rx_prod,
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new(AtomicBool::new(true)), NatControl::new(),
+        );
+        (engine, rx_cons)
+    }
+
+    #[test]
+    fn dns_reply_uses_queried_address_and_guest_port() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (mut e, mut rx) = engine(server.local_addr().unwrap());
+        let requested = Ipv4Addr::new(8, 8, 8, 8);
+        let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+        e.handle_udp(&[1; 6], e.config.client_ip, requested,
+            &udp_packet(e.config.client_ip, requested, 4321, 53, query));
+        let mut response = [0u8; 512];
+        let (n, peer) = server.recv_from(&mut response).unwrap();
+        response[2] |= 0x80;
+        server.send_to(&response[..n], peer).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while rx.is_empty() && Instant::now() < deadline {
+            e.poll_dns();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let frame = rx.pop().expect("guest DNS response");
+        assert_eq!(&frame[26..30], &requested.octets());
+        assert_eq!(&frame[30..34], &e.config.client_ip.octets());
+        assert_eq!(r16(&frame, 34), 53);
+        assert_eq!(r16(&frame, 36), 4321);
+        assert_eq!(&frame[42..], &response[..n]);
+    }
+
+    #[test]
+    fn dhcp_advertises_gateway_dns() {
+        let (mut e, mut rx) = engine("127.0.0.1:53".parse().unwrap());
+        let mut request = vec![0; 244];
+        request[0] = 1;
+        request[236..].copy_from_slice(&[99, 130, 83, 99, 53, 1, 1, 255]);
+        e.handle_bootp(&[1; 6], 68, &request);
+        let reply = rx.pop().expect("DHCP offer");
+        let options = &reply[42 + 240..];
+        let mut pos = 0;
+        while options[pos] != 255 {
+            let code = options[pos];
+            let len = options[pos + 1] as usize;
+            if code == 6 {
+                assert_eq!(&options[pos + 2..pos + 2 + len], &e.config.gateway_ip.octets());
+                return;
+            }
+            pos += 2 + len;
+        }
+        panic!("missing DNS option");
     }
 }
