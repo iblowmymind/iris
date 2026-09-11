@@ -90,9 +90,9 @@ Hit **▶ Start** to boot it.
 
 ### Menu bar
 
-On macOS these are the **system menu bar**; on other platforms they are a
-strip along the top of the window. Both are built from the same description
-(`src/menus.rs`), so the two never drift apart.
+On macOS these menus appear in the **system menu bar** (`src/menus.rs`).
+Windows and Linux retain the upstream sidebar with menus, machine controls,
+and a status footer (`src/classic_ui.rs`).
 
 | Menu | Purpose |
 | --- | --- |
@@ -100,7 +100,7 @@ strip along the top of the window. Both are built from the same description
 | **Machine** | Start, Stop, Reset, Reset NVRAM, Processor, Save/Restore state (slots snap1–4), Screenshot, Serial console, Capture mouse & keyboard |
 | **Memory** | Total presets, plus per-bank submenus |
 | **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions, plus commit/roll-back for copy-on-write overlays |
-| **View** | Fullscreen, emulator scale, menu & dialog scale, Configuration… |
+| **View** | Fullscreen, emulator scale, menu & dialog scale |
 | **Help** | Diagnostics, the explainers, licenses, and About (version + build feature listing) |
 
 The **SCSI** menu is the recommended way to attach / detach / replace
@@ -112,7 +112,7 @@ drives. Each ID shows its current state inline:
 
 ### The window
 
-Once a machine is running the window holds **the emulator screen and nothing
+On macOS, once a machine is running the window holds **the emulator screen and nothing
 else** — the live REX3 framebuffer, drawn centered at a whole number of device
 pixels per emulated pixel wherever it fits (see *Scaling* below). While idle it
 shows the **welcome / status panel** instead: active machine name,
@@ -129,12 +129,15 @@ Everything that used to sit beside it is somewhere else now:
   mouse and keyboard are captured, and the most recent notification. It
   refreshes about four times a second.
 
-### Configuration window
+Windows and Linux keep the controls and status in the main window. The
+configuration editor fills the central pane while stopped, or opens in a side
+panel beside the running display. Dialogs stay inside the main window.
 
-**View → Configuration…** (⌘,) opens the tabbed editor (General / Disks /
-Network / Memory / Display / Video-In / Debug / CI) in its own window. **View →
-Configuration tab** opens it at a particular tab. It starts closed on each
-launch (open/closed state isn't persisted).
+### Configuration editor
+
+On macOS, **File → Configuration…** (⌘,) opens the tabbed editor in a separate
+window. On Windows and Linux, use **Edit config…** in the sidebar or select a
+configuration tab from **View**. The editor starts closed on each launch.
 
 ### Scaling
 
@@ -149,7 +152,7 @@ In **View → Graphics scaling**, choose one of two modes:
 Both options apply to windowed and fullscreen display and persist across launches.
 With two display heads, each head scales within its half of the window.
 
-**View → Emulator scale** resizes the window to a requested size in logical
+**View → Emulator scale** on macOS, or **VM screen** in the sidebar View menu, resizes the window to a requested size in logical
 points per emulated pixel. This is separate from the graphics scaling mode.
 On Retina displays, one logical point typically spans two device pixels.
 
@@ -325,7 +328,8 @@ iris/
 └── iris-gui/
     ├── Cargo.toml     depends on iris with chd, camera, rex-jit on
     └── src/
-        ├── main.rs            App, menu bar, toolbar, modals, update loop
+        ├── main.rs            App, platform layout, modals, update loop
+        ├── classic_ui.rs      Windows/Linux sidebar and embedded configuration
         ├── handle.rs          EmulatorHandle: worker thread, command/event channels
         ├── framebuffer.rs     CaptureRenderer + FrameSink (REX3 → egui texture)
         ├── input.rs           egui → PS/2 keyboard+mouse pump

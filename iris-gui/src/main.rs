@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bench_ui;
+#[cfg(any(not(target_os = "macos"), test))]
+mod classic_ui;
 mod filedialog;
 mod camera_test;
 mod capture_access;
@@ -9,9 +11,7 @@ mod dialogs;
 mod framebuffer;
 mod handle;
 mod input;
-/// The system menu bar. On macOS the app's menus live there rather than in the
-/// window; every other platform draws them as a strip along the top of the
-/// window from the same description (see [`menus`]).
+/// Native macOS menus; other platforms retain the upstream sidebar.
 #[cfg(target_os = "macos")]
 mod macos_menu;
 mod macos_sandbox;
@@ -277,6 +277,10 @@ struct App {
     rename_buffer: Option<String>,
     /// Whether the "Check networking" diagnosis window is open.
     show_net_check: bool,
+    #[cfg(any(not(target_os = "macos"), test))]
+    save_state_name: String,
+    #[cfg(any(not(target_os = "macos"), test))]
+    restore_state_name: String,
     /// egui texture holding the most recent REX3 framebuffer. Allocated
     /// lazily on the first frame that needs it.
     fb_tex: Option<egui::TextureHandle>,
@@ -571,6 +575,10 @@ impl App {
             show_config_editor: false,
             rename_buffer: None,
             show_net_check: false,
+            #[cfg(any(not(target_os = "macos"), test))]
+            save_state_name: "snap1".into(),
+            #[cfg(any(not(target_os = "macos"), test))]
+            restore_state_name: "snap1".into(),
             fb_tex: None,
             fb_tex_head1: None,
             last_fb_seq: 0,
@@ -2668,33 +2676,26 @@ impl eframe::App for App {
         // of squeezing the (decoupled) VM screen.
         if zoom_in || zoom_out || zoom_reset { self.pending_fb_snap = true; }
 
-        // The menus. On macOS they are the system menu bar, rebuilt whenever
-        // the description changes; everywhere else they are a thin strip along
-        // the top of the window. Either way, the item the user picks comes back
-        // as an `Action` and is applied below — after the menu has closed, so a
-        // file dialog it opens isn't stuck behind it.
-        self.refresh_menus(ctx);
         #[cfg(target_os = "macos")]
-        let picked = macos_menu::take_actions();
-        #[cfg(not(target_os = "macos"))]
-        let picked = {
-            // The model is moved out for the duration of the draw so the
-            // closure can still borrow the rest of `self`.
-            let mut picked = None;
-            let menu_model = std::mem::take(&mut self.menus);
-            egui::Panel::top("menu_bar").show(ui, |ui| {
-                picked = menus::show_menu_bar(ui, &menu_model);
-            });
-            self.menus = menu_model;
-            picked.into_iter().collect::<Vec<_>>()
-        };
-        for action in picked {
-            self.apply_menu_action(action, ctx);
+        {
+            self.refresh_menus(ctx);
+            for action in macos_menu::take_actions() {
+                self.apply_menu_action(action, ctx);
+            }
+            self.sync_window_title(ctx);
         }
-
-        // The status line that used to sit under the menus is the window title
-        // now — see `window_title`.
-        self.sync_window_title(ctx);
+        #[cfg(not(target_os = "macos"))]
+        {
+            egui::Panel::left("control_panel")
+                .resizable(false)
+                .exact_size(186.0)
+                .show(ui, |ui| self.control_panel(ui, ctx));
+            let mut config_in_side_panel = self.show_config_editor && self.emu.is_running();
+            egui::Panel::right("config_editor")
+                .resizable(true)
+                .default_size(420.0)
+                .show_collapsible(ui, &mut config_in_side_panel, |ui| self.config_editor_panel(ui));
+        }
 
         // Zero the central panel's inner margin so the emulated display reaches
         // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
@@ -2719,6 +2720,14 @@ impl eframe::App for App {
             // and nothing else: the config editor, help and every confirmation
             // are separate OS windows (see `oswindow`), so nothing is ever
             // painted over the picture.
+            #[cfg(not(target_os = "macos"))]
+            if self.show_config_editor && !self.emu.is_running() {
+                input::force_release(ui.ctx(), &mut self.input_state);
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| self.config_editor_panel(ui));
+                return;
+            }
             if self.emu.is_running() {
                 self.framebuffer_panel(ui);
             } else {
@@ -2754,6 +2763,7 @@ impl eframe::App for App {
         });
 
         // Everything that isn't the emulated display: its own OS window.
+        #[cfg(target_os = "macos")]
         self.config_editor_window(ctx);
         self.network_check_window(ctx);
         self.about_window(ctx);

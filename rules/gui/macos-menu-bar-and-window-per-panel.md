@@ -1,17 +1,16 @@
-# The main window is the guest's display; everything else is elsewhere
+# macOS menu bar and separate windows
 
 iris-gui used to put a 186 pt control column, a collapsible config side panel,
-and a status footer in the same window as the emulated display. All three are
-gone. What replaced them, and the traps in each:
+and a status footer in the same window as the emulated display. On macOS, all
+three are gone. Windows and Linux retain that layout in `classic_ui.rs`. What replaced them, and the traps in each:
 
-## One menu description, two menu bars
+## Native menu description
 
 `src/menus.rs` builds a platform-neutral tree (`Menu` / `Item` / `Action`) from
 app state, and `App::apply_menu_action` is the single place a chosen item takes
 effect. On macOS `src/macos_menu.rs` renders that tree as a real `NSMenu`;
-everywhere else `menus::show_menu_bar` draws it as a strip along the top of the
-window. Add a menu item in the builder and the dispatcher — never in one
-platform's renderer.
+Windows and Linux use the original sidebar menus in `classic_ui.rs`. Shared
+features need an entry in both interfaces.
 
 - **An `NSMenuItem` can't hold a closure.** Each item carries a *tag* indexing
   the action table for the menu as last built; a click queues the `Action` and
@@ -33,10 +32,11 @@ platform's renderer.
   Two versions in one graph is fine — they're bindings over the same runtime —
   as long as no *typed* object is handed between them.
 
-## Every other panel is its own OS window
+## macOS panels use OS windows
 
 `src/oswindow.rs` wraps `Context::show_viewport_immediate`: the config editor,
 the help and diagnostic windows, and every confirmation are separate windows.
+On non-macOS systems the wrapper uses an embedded `egui::Window`.
 Immediate viewports are drawn inside the parent's frame, which is what lets
 their bodies borrow app state directly the way an in-window `egui::Window` did.
 
@@ -51,7 +51,7 @@ their bodies borrow app state directly the way an in-window `egui::Window` did.
   the same state the body's own Cancel button sets, or the window can't be
   dismissed from the title bar.
 
-## The status bar is the window title
+## macOS status appears in the window title
 
 `App::window_title` composes run state, MIPS, networking, on-screen scale, the
 capture hint and the transient toast; `sync_window_title` pushes it at ~4 Hz and

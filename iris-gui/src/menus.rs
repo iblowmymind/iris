@@ -1,13 +1,5 @@
-//! One description of the application menus, rendered two ways.
-//!
-//! The GUI used to keep its menus in a left-hand control column drawn with
-//! egui, inside the same window as the emulated display. On macOS that column
-//! is now the system menu bar ([`crate::macos_menu`]); everywhere else it is a
-//! thin strip along the top of the window. Both are built from the *same*
-//! description — [`App::build_menus`] — and both hand back the same
-//! [`Action`], which [`App::apply_menu_action`] is the single place that acts
-//! on. Adding a menu item means touching the builder and the dispatcher, and
-//! nothing platform-specific.
+//! Menu model and dispatcher for the native macOS menu bar.
+//! Other platforms use the upstream sidebar in `classic_ui`.
 
 use crate::settings;
 use crate::App;
@@ -569,50 +561,6 @@ impl App {
         items.push(Item::Separator);
         items.push(act("About IRIS", Action::About));
         Menu { title: "Help".into(), items }
-    }
-}
-
-/// Draw the menu model as a horizontal strip of menu buttons, returning the
-/// item the user picked. Used on platforms without a system menu bar; on macOS
-/// the same model goes to [`crate::macos_menu`] instead.
-#[cfg(not(target_os = "macos"))]
-pub fn show_menu_bar(ui: &mut egui::Ui, menus: &[Menu]) -> Option<Action> {
-    let mut picked = None;
-    ui.horizontal(|ui| {
-        for menu in menus {
-            ui.menu_button(&menu.title, |ui| {
-                ui.set_min_width(260.0);
-                show_items(ui, &menu.items, &mut picked);
-            });
-        }
-    });
-    picked
-}
-
-#[cfg(not(target_os = "macos"))]
-fn show_items(ui: &mut egui::Ui, items: &[Item], picked: &mut Option<Action>) {
-    for item in items {
-        match item {
-            Item::Separator => {
-                ui.separator();
-            }
-            Item::Info(text) => {
-                ui.label(egui::RichText::new(text).weak().small());
-            }
-            Item::Sub { label, items } => {
-                ui.menu_button(label, |ui| {
-                    ui.set_min_width(240.0);
-                    show_items(ui, items, picked);
-                });
-            }
-            Item::Action { label, action, enabled, checked, .. } => {
-                let text = if *checked { format!("\u{2022} {label}") } else { format!("   {label}") };
-                if ui.add_enabled(*enabled, egui::Button::new(text)).clicked() {
-                    *picked = Some(action.clone());
-                    ui.close();
-                }
-            }
-        }
     }
 }
 
