@@ -21,6 +21,15 @@ mod tests {
     use crate::mips_core::MipsCore;
     use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
     use crate::mips_tlb::PassthroughTlb;
+    // The reference interpreter must sit at the same ISA level as the JIT, or
+    // every MIPS IV opcode the JIT happily compiles (MOVN/MOVZ/MOVCI/PREF/
+    // MOVCF) is rejected by the interpreter with EXC_RI and every such
+    // equivalence test "diverges" for a reason that has nothing to do with the
+    // JIT. Gated on `mips4` rather than `r5k` because `r5k = ["mips4"]` and
+    // `mips4` is the flag that actually selects the ISA level.
+    #[cfg(feature = "mips4")]
+    use crate::mips_cache_v2::PassthroughCacheM4 as PassthroughCache;
+    #[cfg(not(feature = "mips4"))]
     use crate::mips_cache_v2::PassthroughCache;
     use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BUS_BUSY};
     use std::sync::atomic::AtomicU64;
@@ -539,9 +548,14 @@ mod tests {
         };
         for &(vaddr, raw) in code { store(vaddr, raw); }
         for &(vaddr, val) in data { store(vaddr, val); }
+        // Hooks unconditionally: they only install fn pointers, and the
+        // interpreter arm drives `step_jit()` too. Under `jitv2_lockstep` that
+        // arm still executes compiled code (the lockstep comparison runs the JIT
+        // alongside the interpreter), so a store reaching an uninstalled write
+        // hook aborts the process via the `jit_hooks_not_installed_*` panic.
+        exec.install_jit_hooks();
         if jit {
             exec.jitv2_inline_compile = true;
-            exec.install_jit_hooks();
         }
         for _ in 0..steps {
             exec.step_jit();
@@ -1070,14 +1084,11 @@ mod tests {
     fn fpu_seeded_executor(gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool) -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
         let (mut exec, mem) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, pc);
         exec.core.fpr = fpr;
-        exec.core.cp0_status = crate::mips_core::STATUS_CU1 | if fr1 { crate::mips_core::STATUS_FR } else { 0 };
-        // Setting cp0_status directly (bypassing write_cp0's
-        // on_cp0_status_changed callback) leaves the executor's
-        // fpr_read_w/fpr_write_w fn pointers stale at whatever FR mode
-        // MipsExecutor::new() initialized them to — update_fpr_mode()
-        // re-derives them from the live STATUS_FR bit, same as the real
-        // write_cp0 path would trigger automatically.
-        exec.update_fpr_mode();
+        // Setting cp0_status directly bypasses write_cp0's status callback, which would
+        // otherwise leave the executor's fpr_read_w/fpr_write_w fn pointers stale at
+        // whatever FR mode MipsExecutor::new() initialized them to. `set_cp0_status`
+        // stores the word and re-derives, same as the real write_cp0 path.
+        exec.set_cp0_status(crate::mips_core::STATUS_CU1 | if fr1 { crate::mips_core::STATUS_FR } else { 0 });
         (exec, mem)
     }
 
@@ -3066,12 +3077,22 @@ mod tests {
 
     #[test]
     fn skip_entry_preamble_true_bypasses_the_entry_words_own_checks() {
-        // skip_entry_preamble=true (comp.rs's production path): the
-        // interpreter's step() dispatch loop already ran the equivalent
-        // IP7/pending-interrupt checks for this exact PC immediately before
-        // calling into compiled code, so the compiled function's own entry
-        // path must NOT re-check and bail — it should run the entry
-        // instruction's real semantics directly. Proven here by seeding a
+        // skip_entry_preamble=true (comp.rs's production path): the entry
+        // word's own preamble is skipped, so the compiled function runs the
+        // entry instruction's real semantics directly instead of re-checking
+        // and bailing.
+        //
+        // NOTE: this test documents WHAT the production path does, not that
+        // skipping is free. The justification comp.rs used to carry — "step()
+        // already ran the equivalent checks immediately before" — is stale:
+        // `step_jit` runs no `step_preamble!`. The consequence is that
+        // delivery at an external entry is deferred by one dispatch, not
+        // skipped, because every internal back-edge onto an entry word still
+        // routes through the preamble-bearing block — which is exactly what
+        // `skip_entry_preamble_true_still_checks_on_an_internal_back_edge_into_entry`
+        // (below) pins down. Change that pairing together or not at all.
+        //
+        // Proven here by seeding a
         // pending interrupt (core.hot.interrupts != 0) that would normally make
         // emit_pending_interrupt_preamble bail immediately (status
         // EXEC_COMPLETE, pc unchanged) and confirming the entry
@@ -4215,6 +4236,16 @@ mod tests {
     #[test]
     #[cfg(feature = "mips4")]
     fn movci_matches_interpreter_across_all_cc_and_tf_combinations() {
+        // `cu1` is swept, not fixed, because MOVF/MOVT take Coprocessor
+        // Unusable when CU1 is clear (they read FCSR's condition codes -
+        // see `exec_movci`/`emit_movci`). With CU1 left clear, as this test
+        // used to leave it, BOTH engines fault identically and the whole
+        // cc/tf sweep below goes dead: it would pass without ever executing
+        // a single MOVCI. The `cu1 = true` arm tests the semantics; the
+        // `cu1 = false` arm tests that the engines agree on the fault
+        // (cause+CE, EPC, PC), which is the regression test for the CU1
+        // check itself.
+        for cu1 in [false, true] {
         for cc in 0u32..8 {
             for tf in [false, true] {
                 for cc_actual_value in [false, true] {
@@ -4233,6 +4264,8 @@ mod tests {
                     let (mut interp_exec, _) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, 0xFFFF_FFFF_8000_1000);
                     interp_exec.core.fpu_fcsr = 0;
                     interp_exec.core.set_fpu_cc(cc, cc_actual_value);
+                    if cu1 { interp_exec.core.cp0_status |= crate::mips_core::STATUS_CU1; }
+                    else { interp_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1; }
                     interp_exec.exec(instr);
                     let interp_snapshot = CoreSnapshot::capture(&interp_exec.core);
 
@@ -4252,15 +4285,25 @@ mod tests {
                     let mut jit_exec = Box::new(jit_exec);
                     jit_exec.core.fpu_fcsr = 0;
                     jit_exec.core.set_fpu_cc(cc, cc_actual_value);
+                    if cu1 { jit_exec.core.cp0_status |= crate::mips_core::STATUS_CU1; }
+                    else { jit_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1; }
                     jit_exec.install_jit_hooks();
                     unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
                     std::mem::forget(codegen);
                     let jit_snapshot = CoreSnapshot::capture(&jit_exec.core);
 
                     assert_eq!(jit_snapshot, interp_snapshot,
-                        "MOVCI diverged for cc={} tf={} cc_actual={}", cc, tf, cc_actual_value);
+                        "MOVCI diverged for cu1={} cc={} tf={} cc_actual={}", cu1, cc, tf, cc_actual_value);
+
+                    // Guard against this sweep going vacuous again: with CU1
+                    // clear both engines MUST have faulted; with CU1 set
+                    // neither may have.
+                    let took_exception = (interp_snapshot.cp0_status & crate::mips_core::STATUS_EXL) != 0;
+                    assert_eq!(took_exception, !cu1,
+                        "MOVCI must fault exactly when CU1 is clear (cu1={}, cc={})", cu1, cc);
                 }
             }
+        }
         }
     }
 
@@ -6036,11 +6079,17 @@ mod tests {
     // They are RED until the analyzer/codegen changes land.
 
     /// A benign `Excluded` instruction that the interpreter retires with a
-    /// plain PC+4 (no exception, minimal privilege requirements): MTC0 to a
-    /// CP0 register. `exec_mtc0` needs no kernel/CU0 check (unlike CACHE) and
-    /// ends in `handle_exec_complete`, so it is the cleanest stand-in for "an
+    /// plain PC+4 (no exception): MTC0 to a CP0 register, ending in
+    /// `handle_exec_complete` — the cleanest stand-in for "an
     /// unsupported-but-normally-retiring instruction" in a fall-through test.
     /// `rt`/`rd` are chosen so both engines apply the identical CP0 write.
+    ///
+    /// Privilege note: `exec_cop0` gates on Kernel-or-CU0 (same rule as CACHE).
+    /// Callers rely on the seeded executor being in Kernel mode — `reset` leaves
+    /// `Status.ERL` set, and EXL|ERL forces Kernel — so this retires rather than
+    /// raising EXC_CPU. A helper that clears ERL *and* sets KSU=USER without
+    /// setting CU0 would turn every use of this into a coprocessor-unusable
+    /// exception, which is not what these fall-through tests mean to exercise.
     fn benign_excluded_mtc0() -> u32 {
         // MTC0 rt=1 -> rd=4 (CP0 Context): `write_cp0(4, ..)` is a plain field
         // assignment with no timer/scheduling side effects (unlike Count(9)/
@@ -6487,21 +6536,53 @@ mod tests {
         // Synthetic caller: mirrors the trace's shape around 0x88237354 — set up
         // a1, jal mutex_lock, then the faulting `lw t6, 84(s3)`, then a clean
         // sentinel exit (jr ra to a fixed return address the driver stops at).
+        // The caller must save and restore `ra` around its own `jal`, exactly as
+        // real code does: `jal mutex_lock` clobbers `ra` with the caller's
+        // return address, so without a frame the closing `jr ra` jumps back into
+        // the caller instead of returning to the sentinel — a three-instruction
+        // infinite loop (+0x10 -> +0x14 -> +0x18 -> +0x10) that neither engine
+        // ever leaves. That is what the original "quiesce at the ra sentinel"
+        // comment got wrong: the chain never returned at all, so a fixed step
+        // count sampled two mid-flight states.
         let jal_mutex = 0x0c00_0000u32 | (((mutex_base & 0x0FFF_FFFF) >> 2) as u32);
         let caller = [
-            (caller_base + 0x00, 0x24050014u32), // addiu a1, zero, 20
-            (caller_base + 0x04, 0x02c02025u32), // or a0, s6, zero
-            (caller_base + 0x08, jal_mutex),     // jal mutex_lock
-            (caller_base + 0x0c, 0x24050018u32), // addiu a1, zero, 24 (slot)
-            (caller_base + 0x10, 0x8e6e0054u32), // lw t6, 84(s3)   <-- the live fault site
-            (caller_base + 0x14, 0x03e00008u32), // jr ra  (return to sentinel)
-            (caller_base + 0x18, 0x00000000u32), // nop (slot)
+            (caller_base + 0x00, 0x27bdffe0u32), // addiu sp, sp, -32   (frame)
+            (caller_base + 0x04, 0xffbf0010u32), // sd   ra, 16(sp)     (save ra)
+            (caller_base + 0x08, 0x24050014u32), // addiu a1, zero, 20
+            (caller_base + 0x0c, 0x02c02025u32), // or   a0, s6, zero
+            (caller_base + 0x10, jal_mutex),     // jal  mutex_lock
+            (caller_base + 0x14, 0x24050018u32), // addiu a1, zero, 24  (slot)
+            (caller_base + 0x18, 0x8e6e0054u32), // lw   t6, 84(s3)  <-- the live fault site
+            (caller_base + 0x1c, 0xdfbf0010u32), // ld   ra, 16(sp)     (restore ra)
+            (caller_base + 0x20, 0x03e00008u32), // jr   ra             (-> sentinel)
+            (caller_base + 0x24, 0x27bd0020u32), // addiu sp, sp, 32    (slot)
+        ];
+
+        // Quiescent sentinel: `ra` points at a `jr $ra`-to-SELF whose delay slot
+        // is a nop, so once either engine returns here its pc is *pinned* at
+        // `ra` and stays there however many steps remain.
+        //
+        // This replaces an all-zero landing page, which did not quiesce at all:
+        // NOPs advance pc, so each engine walked forward through zero memory at
+        // its own rate and a fixed step count sampled them at different PCs.
+        // Every GPR matched; only `pc` differed (by 8 bytes), so the test was
+        // reporting a divergence that did not exist. Same idiom, and the same
+        // reasoning, as `assert_bc1_fallback_matches`: a RegJump is always a
+        // region boundary, so the JIT exits and `step()` returns on every
+        // dispatch, keeping both engines in lockstep at the sentinel. (A BEQ
+        // self-loop would instead compile to an infinite in-region loop the JIT
+        // never leaves within one `step()`.)
+        let ra_sentinel = 0xFFFF_FFFF_8000_0000u64;
+        let sentinel = [
+            (ra_sentinel + 0x00, 0x03e00008u32), // jr ra, with ra == ra_sentinel
+            (ra_sentinel + 0x04, 0x00000000u32), // nop (delay slot)
         ];
 
         let mut code: Vec<(u64, u32)> = Vec::new();
         code.extend_from_slice(&cas);
         code.extend_from_slice(&mutex);
         code.extend_from_slice(&caller);
+        code.extend_from_slice(&sentinel);
 
         // Data: a valid stack, a valid s3 with [s3+84] populated, and the mutex
         // word cas operates on. The `lw a2,-24552(zero)` global cas reads is
@@ -6519,15 +6600,25 @@ mod tests {
         gpr[19] = s3_ptr;                 // s3 (callee-saved, live across calls)
         gpr[22] = mutex_wrd;              // s6 -> a0 (the mutex pointer)
         gpr[29] = stack_top;              // sp
-        gpr[31] = 0xFFFF_FFFF_8000_0000u64; // ra sentinel (top-level return target)
+        gpr[31] = ra_sentinel; // top-level return target — the jr-to-self above
 
         let pc = caller_base;
-        // Generous step budget; both engines quiesce at the ra sentinel (an
-        // all-zero page — they'll just spin on NOPs identically past that, which
-        // is fine since we compare final state after a fixed count).
+        // Generous budget: the call chain finishes well inside this, and both
+        // engines then sit pinned at the sentinel for the remaining steps, so
+        // the exact count no longer decides the result. Deliberately *not*
+        // tuned to the chain's length — a count that happens to line the two
+        // engines up would hide the very divergence this test exists to find.
         let steps = 60;
         let interp = run_multipage(&code, &data, gpr, pc, steps, false);
         let jit    = run_multipage(&code, &data, gpr, pc, steps, true);
+
+        // Guard against a vacuous pass: if the chain never returned, both
+        // snapshots could match while proving nothing about the call sequence.
+        assert_eq!(interp.pc, ra_sentinel,
+            "setup: the interpreter must reach the ra sentinel within {steps} steps \
+             (got pc={:#x}) — otherwise this test compares two mid-flight states",
+            interp.pc);
+
         assert_eq!(jit, interp,
             "JIT (fallback on) diverged from interpreter on the full mutex_lock/CAS call chain");
     }

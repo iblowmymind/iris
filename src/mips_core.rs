@@ -90,8 +90,25 @@ pub const KSU_USER: u32 = 0b10;
 #[repr(align(64))]
 #[derive(Default)]
 pub struct Hot {
-    /// Interrupt-pending word. Bits 8..15 = IP0..IP7 (mirror CAUSE.IP
-    /// layout). Bit 63 = soft-reset request. A real atomic (unlike
+    /// Interrupt-pending word, laid out to mirror CAUSE.IP (bits 8..15 =
+    /// IP0..IP7) so the preamble can mask and merge without shifting.
+    ///
+    /// Only **IP2..IP7** are ever set here, though: those are the external
+    /// lines (devices via the IOC, plus IP7 from the compare timer on the
+    /// hptimer thread), and `EXT_INT_MASK` in mips_exec.rs merges exactly
+    /// that range into Cause. **IP0/IP1 are software interrupts, written
+    /// only by `mtc0 Cause`** (see `write_cp0`), and live in `cp0_cause`
+    /// alone — nothing external ever sets bits 8/9 of this word.
+    ///
+    /// That asymmetry matters for jitv2: compiled code samples this atomic
+    /// but never reads `cp0_cause`, so a *software* interrupt is invisible
+    /// to it. That is sound rather than a missed delivery, because IP0/IP1
+    /// cannot change inside a region — the only writers are `mtc0 Cause`
+    /// (Excluded, so it runs in `step_int`) and exception delivery (which
+    /// touches ExcCode only), and the word after either is dispatched
+    /// through the interpreter's own preamble.
+    ///
+    /// Bit 63 = soft-reset request. A real atomic (unlike
     /// `cycles` below): devices set/clear individual bits from their own
     /// thread via `fetch_or`/`fetch_and`, which needs a genuine RMW, not
     /// just eventual visibility of a monotonic count.
@@ -1784,7 +1801,17 @@ impl MipsCore {
     /// When reg 12 (Status) is written, invokes `status_changed_cb` with (old, new).
     pub fn write_cp0(&mut self, reg: u32, value: u64) {
         match reg {
-            0 => self.cp0_index = value as u32,
+            // Index: slot field [5:0] plus the probe-failure bit [31]. Bits
+            // [30:6] are reserved and read as zero.
+            //
+            // The P bit is kept deliberately, unlike MAME's r4000 core (which
+            // masks it away with `& 0x3f` here): software reads Index back with
+            // MFC0 to test whether a TLBP missed, and a context switch that
+            // saves and restores Index must round-trip that bit. Bounding the
+            // slot field is what prevents the out-of-range write; dropping P is
+            // not needed for that and would lose architectural state.
+            0 => self.cp0_index = (value as u32)
+                    & (crate::mips_exec::CP0_INDEX_P | crate::mips_exec::CP0_INDEX_SLOT_MASK),
             1 => { /* Random is read-only */ }
             2 => self.cp0_entrylo0 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
             3 => self.cp0_entrylo1 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
@@ -2273,6 +2300,18 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
     };
 
     core.pc = vector_base + offset;
+
+    // Jumping to a handler vector ends any delay slot in progress: the vector's
+    // first instruction is never in one. `bd` was already consumed above (into
+    // Cause.BD / EPC), so clearing here cannot lose information.
+    //
+    // Hung on the delivery function rather than on its callers so it cannot be
+    // forgotten. The three executor wrappers used to each clear this themselves,
+    // which left `bin/jitv2_verify.rs`'s bare-`MipsCore` call — no wrapper — able
+    // to enter a handler with `in_delay_slot` still set. Same
+    // "every caller must remember" shape as the CP0-Status resync bug; see
+    // rules/testing/cp0-status-writes-must-resync-privilege-state.md.
+    core.in_delay_slot = false;
 }
 
 /// CPU Privilege Modes
