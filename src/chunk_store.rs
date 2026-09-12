@@ -66,14 +66,17 @@ impl ChunkStore {
         let hash: ChunkHash = blake3::hash(data).into();
         let path = self.path_for(&hash);
         if path.exists() {
+            self.get(&hash)?;
             return Ok(hash);
         }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("chunk.tmp");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = path.with_extension(format!("chunk.{}.{}.tmp", std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         {
-            let mut f = fs::File::create(&tmp)?;
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             f.write_all(data)?;
         }
         // Rename is atomic on POSIX. If two threads raced, the loser's
@@ -87,6 +90,10 @@ impl ChunkStore {
         let mut f = fs::File::open(&path)?;
         let mut data = Vec::with_capacity(CHUNK_SIZE);
         f.read_to_end(&mut data)?;
+        if blake3::hash(&data).as_bytes() != hash {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("Snapshot chunk checksum mismatch: {}", path.display())));
+        }
         Ok(data)
     }
 
@@ -230,6 +237,35 @@ pub fn get_chunks_as_words(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_corrupted_chunk() {
+        let dir = unique_tmp_dir("corrupt");
+        let store = ChunkStore::new(&dir);
+        let hash = store.put(b"original").unwrap();
+        fs::write(store.path_for(&hash), b"corrupt!").unwrap();
+        assert_eq!(store.get(&hash).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(store.put(b"original").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_identical_puts_are_complete() {
+        let dir = unique_tmp_dir("concurrent");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let store = ChunkStore::new(&dir);
+                    let data = vec![0x5a; CHUNK_SIZE];
+                    barrier.wait();
+                    let hash = store.put(&data).unwrap();
+                    assert_eq!(store.get(&hash).unwrap(), data);
+                });
+            }
+        });
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

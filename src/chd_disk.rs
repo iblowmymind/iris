@@ -14,6 +14,75 @@ use libchdman_rs::cd::CdCookedReader;
 use libchdman_rs::hd::HdImage;
 use libchdman_rs::Chd;
 
+// A standalone COW copy is necessary for uncompressed parents with no SHA-1.
+// MAME cannot represent a parent relationship with an all-zero parent hash.
+const STANDALONE_PARENT_TAG: u32 = u32::from_be_bytes(*b"IRIS");
+
+fn file_hash(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+fn open_merged(base: &Path, diff: &Path) -> io::Result<HdImage> {
+    let probe = Chd::open(diff.to_str().ok_or_else(||
+        io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?, false, None);
+    if let Ok(chd) = probe {
+        if chd.parent_sha1() == [0; 20] {
+            let expected = chd.read_metadata(STANDALONE_PARENT_TAG, 0).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData,
+                    "CHD overlay has no parent identity; preserve it and recreate the overlay from its base")
+            })?;
+            if expected != file_hash(base)? {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "CHD overlay base has changed"));
+            }
+            drop(chd);
+            return HdImage::open(diff).map_err(map_err);
+        }
+    }
+    HdImage::reopen_diff(base, diff).map_err(map_err)
+}
+
+fn create_overlay(base: &Path, diff: &Path) -> io::Result<HdImage> {
+    let parent = Chd::open(base.to_str().ok_or_else(||
+        io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?, false, None).map_err(map_err)?;
+    if parent.sha1() != [0; 20] {
+        drop(parent);
+        let tmp = temp_sync_path_for(diff);
+        let result = (|| {
+            let image = HdImage::open_with_diff(base, &tmp).map_err(map_err)?;
+            drop(image);
+            fsync_path(&tmp)?;
+            std::fs::rename(&tmp, diff)?;
+            open_merged(base, diff)
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+        return result;
+    }
+    drop(parent);
+    // Copy the CHD container, not its logical sectors: unallocated hunks stay
+    // unallocated even for a disk whose virtual capacity is hundreds of GB.
+    let hash = file_hash(base)?;
+    let tmp = temp_sync_path_for(diff);
+    let result = (|| {
+        std::fs::copy(base, &tmp)?;
+        let mut copy = HdImage::open(&tmp).map_err(map_err)?;
+        copy.as_chd_mut().write_metadata(STANDALONE_PARENT_TAG, 0, &hash, 0).map_err(map_err)?;
+        drop(copy);
+        fsync_path(&tmp)?;
+        std::fs::rename(&tmp, diff)?;
+        open_merged(base, diff)
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
+}
+
 fn map_err<E: std::fmt::Debug>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("{:?}", e))
 }
@@ -50,6 +119,7 @@ impl ChdHd {
     pub fn open(path: &str, cow: bool) -> io::Result<Self> {
         let p = Path::new(path);
         let diff = diff_path_for(p);
+        recover_sync(p, &diff)?;
 
         // Cases:
         //  - a diff already exists → reattach to it; it carries changes from a
@@ -59,17 +129,20 @@ impl ChdHd {
         //  - no diff, base opens writable in place (uncompressed, COW off) → no diff.
         //  - no diff, base won't open writable (compressed) → create a fresh diff.
         let (img, diff_path, dirty) = if diff.exists() {
-            (HdImage::reopen_diff(p, &diff).map_err(map_err)?, Some(diff), true)
+            (open_merged(p, &diff)?, Some(diff), true)
         } else if cow {
-            (HdImage::open_with_diff(p, &diff).map_err(map_err)?, Some(diff), false)
+            (create_overlay(p, &diff)?, Some(diff), false)
         } else {
             match HdImage::open(p) {
                 Ok(img) => (img, None, false),
-                Err(_) => (HdImage::open_with_diff(p, &diff).map_err(map_err)?, Some(diff), false),
+                Err(_) => (create_overlay(p, &diff)?, Some(diff), false),
             }
         };
 
         let sector_size = img.sector_size();
+        if sector_size == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "CHD has zero-byte sectors"));
+        }
         let total_bytes = img.sector_count() * u64::from(sector_size);
         Ok(Self { img, sector_size, total_bytes, base_path: p.to_path_buf(), diff_path, dirty, cow })
     }
@@ -104,6 +177,14 @@ impl ChdHd {
         self.total_bytes
     }
 
+    pub fn flush(&mut self) -> io::Result<()> {
+        // MAME writes hunks and map entries through to the OS before returning;
+        // SYNCHRONIZE CACHE must additionally make those writes durable.
+        let path = self.diff_path.as_deref().unwrap_or(&self.base_path);
+        fsync_path(path)?;
+        fsync_dir(path.parent())
+    }
+
     pub fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
         let ss = u64::from(self.sector_size);
         if block_size != ss {
@@ -112,7 +193,10 @@ impl ChdHd {
                 format!("CHD HD sector size {} != requested block size {}", ss, block_size),
             ));
         }
-        let mut buf = vec![0u8; count * ss as usize];
+        self.check_range(lba, count)?;
+        let bytes = count.checked_mul(ss as usize).ok_or_else(||
+            io::Error::new(io::ErrorKind::InvalidInput, "CHD read length overflow"))?;
+        let mut buf = vec![0u8; bytes];
         for i in 0..count {
             let off = i * ss as usize;
             self.img
@@ -131,6 +215,11 @@ impl ChdHd {
             ));
         }
         let count = data.len() / ss;
+        self.check_range(lba, count)?;
+        // A failing multi-sector write may already have changed the diff.
+        if count != 0 && self.diff_path.is_some() {
+            self.dirty = true;
+        }
         for i in 0..count {
             let off = i * ss;
             self.img
@@ -143,6 +232,44 @@ impl ChdHd {
             self.dirty = true;
         }
         Ok(())
+    }
+
+    fn check_range(&self, lba: u64, count: usize) -> io::Result<()> {
+        let sectors = self.total_bytes / u64::from(self.sector_size);
+        if lba > sectors || count as u64 > sectors - lba {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "CHD request exceeds disk capacity"));
+        }
+        Ok(())
+    }
+}
+
+/// The compressor treats read errors and premature EOF as zero padding. Keep
+/// an independent error channel so a damaged source can never replace a disk.
+struct CheckedReader<R> {
+    inner: R,
+    remaining: u64,
+    error: std::sync::Arc<std::sync::Mutex<Option<io::Error>>>,
+}
+
+impl<R: Read> Read for CheckedReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() || self.remaining == 0 { return Ok(0); }
+        let len = out.len().min(self.remaining.min(usize::MAX as u64) as usize);
+        let result = loop {
+            match self.inner.read(&mut out[..len]) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(0) => break Err(io::Error::new(io::ErrorKind::UnexpectedEof, "CHD source ended during merge")),
+                other => break other,
+            }
+        };
+        match result {
+            Ok(n) => { self.remaining -= n as u64; Ok(n) }
+            Err(e) => {
+                let mut error = self.error.lock().unwrap();
+                if error.is_none() { *error = Some(io::Error::new(e.kind(), e.to_string())); }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -187,10 +314,9 @@ impl Read for MergedReader {
 /// sizes (so a compressed base stays compressed), via a temp file + atomic
 /// rename, then delete the diff.
 ///
-/// Safety: the base is only ever replaced by an atomic rename of a fully-written,
-/// fsynced temp file, and the diff is deleted only after that rename succeeds. On
-/// any error or cancellation the base and diff are left exactly as they were, so
-/// the next launch simply reattaches the diff — nothing is lost.
+/// The base is replaced only after the output has been checked and synced.
+/// A durable journal identifies an installed replacement if shutdown interrupts
+/// removal of its old diff. Opening the disk completes that cleanup before use.
 ///
 /// `progress(fraction)` receives 0.0..=1.0; `cancel()` aborts cleanly. The caller
 /// MUST have dropped any open [`ChdHd`] for this base first (so the files are
@@ -205,23 +331,61 @@ pub fn flatten_diff(
     use libchdman_rs::{Chd, CompressionProgress};
 
     let base_str = base.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
+    recover_sync(base, diff)?;
+    if cancel() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "CHD merge cancelled"));
+    }
+
+    let merged = open_merged(base, diff)?;
+    if merged.as_chd().read_metadata(STANDALONE_PARENT_TAG, 0).is_ok() {
+        drop(merged);
+        let tmp = temp_sync_path_for(base);
+        let result = (|| {
+            std::fs::copy(diff, &tmp)?;
+            let mut copy = HdImage::open(&tmp).map_err(map_err)?;
+            copy.as_chd_mut().delete_metadata(STANDALONE_PARENT_TAG, 0).map_err(map_err)?;
+            drop(copy);
+            if cancel() { return Err(io::Error::new(io::ErrorKind::Interrupted, "CHD merge cancelled")); }
+            install_rebuilt(base, diff, &tmp)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result?;
+        progress(1.0);
+        return Ok(());
+    }
+    drop(merged);
 
     // Read the base's structure so the rebuilt CHD matches it byte-for-byte in
     // codecs/geometry (compressed stays compressed). Scope the handle so it's
     // closed before we rename over the base.
-    let (codecs, hunk_bytes, unit_bytes, logical, geom) = {
+    let (codecs, hunk_bytes, unit_bytes, logical, geom, ident) = {
         let bchd = Chd::open(base_str, false, None).map_err(map_err)?;
         let info = bchd.info().map_err(map_err)?;
         if !info.is_hd {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a hard-disk CHD"));
         }
-        (info.codecs, info.hunk_bytes, info.unit_bytes, info.logical_bytes, read_geometry(&bchd).ok())
+        // The high-level compressor only preserves GDDD and IDNT. Refuse to
+        // silently drop any other metadata until it can be copied faithfully.
+        let gddd = u32::from_be_bytes(*b"GDDD");
+        let idnt = u32::from_be_bytes(*b"IDNT");
+        if info.metadata_tags.iter().any(|&(tag, index)| (tag != gddd && tag != idnt) || index != 0) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "CHD merge cannot preserve this image's additional metadata; keeping its overlay"));
+        }
+        let ident = if info.metadata_tags.contains(&(idnt, 0)) {
+            Some(bchd.read_metadata(idnt, 0).map_err(map_err)?)
+        } else { None };
+        (info.codecs, info.hunk_bytes, info.unit_bytes, info.logical_bytes,
+            Some(read_geometry(&bchd).map_err(map_err)?), ident)
     };
 
     // Merged view: parent (base) with the diff applied. Its sectors are the
     // contents we rebuild the base from.
-    let merged = HdImage::reopen_diff(base, diff).map_err(map_err)?;
+    let merged = open_merged(base, diff)?;
     let sector_size = merged.sector_size() as usize;
+    if sector_size == 0 || !logical.is_multiple_of(sector_size as u64) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid CHD sector geometry"));
+    }
     let sector_count = merged.sector_count();
 
     // Rebuild into a temp file next to the base (same filesystem → the rename is
@@ -234,33 +398,99 @@ pub fn flatten_diff(
         unit_size: unit_bytes,
         codecs,
         geometry: geom,
-        ident: None,
+        ident,
     };
-    let reader = MergedReader::new(merged, sector_size, sector_count);
+    let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let reader = CheckedReader {
+        inner: MergedReader::new(merged, sector_size, sector_count),
+        remaining: logical,
+        error: error.clone(),
+    };
     let total = logical.max(1);
     let mut cb = |cp: CompressionProgress| {
         progress((cp.bytes_done as f64 / total as f64).min(1.0) as f32);
     };
-    if let Err(e) = create_from_reader(reader, &tmp, opts, &mut cb, cancel) {
+    let result = create_from_reader(reader, &tmp, opts, &mut cb, cancel).map_err(map_err);
+    let result = match error.lock().unwrap().take() {
+        Some(e) => Err(e),
+        None => result,
+    };
+    if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp); // base + diff untouched
-        return Err(map_err(e));
+        return Err(e);
     }
 
     // Durably replace the base, then drop the diff. The diff is removed only
     // after the rename, so an interruption anywhere above leaves base+diff intact.
-    fsync_path(&tmp)?;
-    std::fs::rename(&tmp, base)?;
-    let _ = fsync_dir(base.parent());
-    let _ = std::fs::remove_file(diff);
+    install_rebuilt(base, diff, &tmp)?;
     progress(1.0);
     Ok(())
 }
 
 /// Temp path for the rebuilt CHD, alongside the base so the rename is atomic.
 fn temp_sync_path_for(base: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut s = base.as_os_str().to_owned();
-    s.push(".synctmp.chd");
+    s.push(format!(".{}.{}.synctmp.chd", std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     PathBuf::from(s)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyncJournal {
+    original: Vec<u8>,
+    replacement: Vec<u8>,
+    diff: Vec<u8>,
+}
+
+fn journal_path(base: &Path) -> PathBuf {
+    let mut path = base.as_os_str().to_owned();
+    path.push(".sync.json");
+    PathBuf::from(path)
+}
+
+fn recover_sync(base: &Path, diff: &Path) -> io::Result<()> {
+    let path = journal_path(base);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let journal: SyncJournal = serde_json::from_reader(file).map_err(|e|
+        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid CHD merge journal: {e}")))?;
+    let current = file_hash(base)?;
+    if current == journal.replacement {
+        match file_hash(diff) {
+            Ok(hash) if hash == journal.diff => {
+                std::fs::remove_file(diff)?;
+                fsync_dir(diff.parent())?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "CHD diff changed during interrupted merge; preserve base and diff for recovery")),
+        }
+    } else if current != journal.original {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "CHD base changed during interrupted merge; preserve base and diff for recovery"));
+    }
+    std::fs::remove_file(path)?;
+    fsync_dir(base.parent())
+}
+
+fn install_rebuilt(base: &Path, diff: &Path, tmp: &Path) -> io::Result<()> {
+    use std::io::Write;
+    fsync_path(tmp)?;
+    let journal = SyncJournal {
+        original: file_hash(base)?, replacement: file_hash(tmp)?, diff: file_hash(diff)?,
+    };
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(journal_path(base))?;
+    file.write_all(&serde_json::to_vec(&journal).map_err(map_err)?)?;
+    file.sync_all()?;
+    drop(file);
+    fsync_dir(base.parent())?;
+    std::fs::rename(tmp, base)?;
+    fsync_dir(base.parent())?;
+    recover_sync(base, diff)
 }
 
 fn fsync_path(p: &Path) -> io::Result<()> {
@@ -268,9 +498,13 @@ fn fsync_path(p: &Path) -> io::Result<()> {
 }
 
 fn fsync_dir(dir: Option<&Path>) -> io::Result<()> {
+    #[cfg(unix)]
     if let Some(d) = dir {
+        let d = if d.as_os_str().is_empty() { Path::new(".") } else { d };
         std::fs::File::open(d)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -351,6 +585,104 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn sparse_disk_round_trip() {
+        for cow in [false, true] {
+            let base = unique_base();
+            let mut chd = Chd::create(base.to_str().unwrap(), 131072, 4096, 512, [0; 4]).unwrap();
+            chd.write_metadata(u32::from_be_bytes(*b"GDDD"), 0,
+                b"CYLS:4,HEADS:4,SECS:16,BPS:512\0", 1).unwrap();
+            drop(chd);
+            let mut hd = ChdHd::open(base.to_str().unwrap(), cow).unwrap();
+            assert_eq!(hd.size(), 131072);
+            assert_eq!(hd.read_blocks(0, 8, 512).unwrap(), vec![0; 4096]);
+            hd.write_sectors(1, &[0x5a; 512]).unwrap();
+            hd.write_sectors(255, &[0xa5; 512]).unwrap();
+            drop(hd);
+            let mut hd = ChdHd::open(base.to_str().unwrap(), cow).unwrap();
+            assert_eq!(hd.read_blocks(0, 1, 512).unwrap(), vec![0; 512]);
+            assert_eq!(hd.read_blocks(1, 1, 512).unwrap(), vec![0x5a; 512]);
+            assert_eq!(hd.read_blocks(2, 1, 512).unwrap(), vec![0; 512]);
+            assert_eq!(hd.read_blocks(255, 1, 512).unwrap(), vec![0xa5; 512]);
+            assert!(hd.write_sectors(255, &[0xff; 1024]).is_err());
+            assert_eq!(hd.read_blocks(255, 1, 512).unwrap(), vec![0xa5; 512]);
+            drop(hd);
+            if cow {
+                flatten_diff(&base, &diff_path_for(&base), &mut |_| {}, &|| false).unwrap();
+                assert!(std::fs::metadata(&base).unwrap().len() < 32768);
+                let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
+                assert_eq!(hd.read_blocks(1, 1, 512).unwrap(), vec![0x5a; 512]);
+                assert_eq!(hd.read_blocks(255, 1, 512).unwrap(), vec![0xa5; 512]);
+            }
+            let _ = std::fs::remove_file(diff_path_for(&base));
+            std::fs::remove_file(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn compression_source_errors_are_latched() {
+        for fail in [false, true] {
+            struct Broken(bool);
+            impl Read for Broken {
+                fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                    if self.0 { Err(io::Error::other("injected disk read failure")) } else { Ok(0) }
+                }
+            }
+            let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let reader = CheckedReader { inner: Broken(fail), remaining: 131072, error: error.clone() };
+            let tmp = unique_base();
+            // Upstream reports success even for an unreadable source.
+            create_from_reader(reader, &tmp, HdCreateOptions {
+                logical_size: 131072, ..Default::default()
+            }, &mut |_| {}, &|| false).unwrap();
+            let kind = error.lock().unwrap().as_ref().unwrap().kind();
+            assert_eq!(kind, if fail { io::ErrorKind::Other } else { io::ErrorKind::UnexpectedEof });
+            std::fs::remove_file(tmp).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_merge_finishes_cleanup() {
+        let base = unique_base();
+        let diff = diff_path_for(&base);
+        std::fs::write(&base, b"new disk").unwrap();
+        std::fs::write(&diff, b"old diff").unwrap();
+        let journal = SyncJournal { original: vec![0; 32], replacement: file_hash(&base).unwrap(), diff: file_hash(&diff).unwrap() };
+        std::fs::write(journal_path(&base), serde_json::to_vec(&journal).unwrap()).unwrap();
+        recover_sync(&base, &diff).unwrap();
+        assert!(!diff.exists());
+        assert!(!journal_path(&base).exists());
+        assert_eq!(std::fs::read(&base).unwrap(), b"new disk");
+        std::fs::remove_file(base).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires chdman; creates a 240 GB logical disk with a 234 MB hunk map"]
+    fn chdman_sparse_large_disk() {
+        let base = unique_base();
+        let status = std::process::Command::new("chdman")
+            .args(["createhd", "-ss", "512", "-chs", "128,16,228882", "-c", "none", "-o"])
+            .arg(&base).status().unwrap();
+        assert!(status.success());
+        let bytes = 128_u64 * 16 * 228882 * 512;
+        let original = file_hash(&base).unwrap();
+        let mut hd = ChdHd::open(base.to_str().unwrap(), true).unwrap();
+        assert_eq!(hd.size(), bytes);
+        assert_eq!(hd.read_blocks(0, 1, 512).unwrap(), vec![0; 512]);
+        hd.write_sectors(bytes / 512 - 1, &[0xa5; 512]).unwrap();
+        drop(hd);
+        assert_eq!(file_hash(&base).unwrap(), original);
+        let mut hd = ChdHd::open(base.to_str().unwrap(), true).unwrap();
+        assert_eq!(hd.read_blocks(bytes / 512 - 1, 1, 512).unwrap(), vec![0xa5; 512]);
+        drop(hd);
+        flatten_diff(&base, &diff_path_for(&base), &mut |_| {}, &|| false).unwrap();
+        assert!(std::fs::metadata(&base).unwrap().len() < 300_000_000);
+        let mut hd = ChdHd::open(base.to_str().unwrap(), false).unwrap();
+        assert_eq!(hd.read_blocks(bytes / 512 - 1, 1, 512).unwrap(), vec![0xa5; 512]);
+        drop(hd);
+        std::fs::remove_file(base).unwrap();
     }
 
     /// End-to-end: a compressed base gets a write via its diff, and flatten folds

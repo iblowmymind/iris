@@ -1424,20 +1424,24 @@ impl Device for Vino {
                 }
             }
             "status" => {
-                let st = self.state.lock();
                 let log = devlog_is_active(LogModule::Vino);
 
                 writeln!(writer, "VINO Status  (debug {})", if log { "on" } else { "off" })
                     .map_err(|e| e.to_string())?;
 
-                let d0_status = self.source_d0.lock()
+                let d0 = self.source_d0.lock().clone();
+                let d1 = self.source_d1.lock().clone();
+                let d0_status = d0
                     .as_ref()
                     .map(|s| s.status())
                     .unwrap_or_else(|| "none".to_string());
-                let d1_status = self.source_d1.lock()
+                let d1_status = d1
                     .as_ref()
                     .map(|s| s.status())
                     .unwrap_or_else(|| "none".to_string());
+                // Source callbacks can read CDMC registers through this VINO.
+                // Acquire device state only after those callbacks return.
+                let st = self.state.lock();
                 writeln!(writer, "  source D0 (composite): {}", d0_status).map_err(|e| e.to_string())?;
                 writeln!(writer, "  source D1 (IndyCam):   {}", d1_status).map_err(|e| e.to_string())?;
                 writeln!(writer, "  REV_ID      = {:#010x}  (chip_id={:#x} rev={})",
@@ -1498,6 +1502,23 @@ mod tests {
     use super::*;
     use crate::traits::{BusDevice, BUS_OK};
     use crate::video_source::{Field, FieldParity};
+
+    #[test]
+    fn status_with_cdmc_source_does_not_deadlock() {
+        use crate::video_source::{BlackSource, CdmcAdjustedSource, VideoStandard};
+        let vino = Vino::new();
+        vino.set_source(Arc::new(CdmcAdjustedSource::new(
+            Arc::new(BlackSource::new(VideoStandard::Ntsc)), vino.clone(),
+        )));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = vino.execute_command("vino", &["status"], Box::new(std::io::sink()));
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("VINO status deadlocked while reading CDMC source status")
+            .unwrap();
+    }
 
     /// Mock BusDevice that captures every write64 call.  We only care about
     /// 64-bit writes — that's all `dma_emit_dword` issues.

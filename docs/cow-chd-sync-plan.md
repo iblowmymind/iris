@@ -1,5 +1,10 @@
 # Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown
 
+Current integrity behavior supersedes the historical v1 guarantees below. See
+[CHD sparse and integrity notes](../rules/testing/chd-sparse-and-integrity.md)
+for standalone sparse overlays, journaled merge recovery, and the CHD snapshot
+restriction. The per-disk COW toggle is implemented.
+
 Status: **flatten-on-exit (Phases 2–5) implemented 2026-06-18; Phase 1 COW toggle
 still pending.** What ships now folds an existing `.diff.chd` back into its base
 on a clean app exit, with a "Synchronizing disks…" modal — covering the
