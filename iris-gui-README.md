@@ -96,7 +96,7 @@ Hit **▶ Start** to boot it.
 | **Machine** | Start, Stop, Reset, Save state, Restore state, Screenshot |
 | **Memory** | Total presets, plus per-bank submenus |
 | **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions |
-| **View** | Fullscreen (F11), UI scale |
+| **View** | Fullscreen (F11), UI scale, graphics scaling, VM screen size |
 | **Help** | Version + build feature listing |
 
 The **SCSI** menu is the recommended way to attach / detach / replace
@@ -123,6 +123,23 @@ running — the live REX3 framebuffer, drawn aspect-fit and centered. While
 idle it falls back to the **welcome / status panel**: active machine name,
 PROM/NVRAM/RAM summary, attached drive list, network mode, and the big
 Start button.
+
+### Scaling
+
+In **View → Graphics scaling**, choose one of two modes:
+
+- **Nearest integer** (default): centers the display at the largest whole
+  device-pixel scale that fits, with black space around it. If the window is
+  smaller than the framebuffer at 1×, it scales down with filtering.
+- **Stretch**: fills the window using linear filtering. Enable **Keep aspect
+  ratio** to fit the largest undistorted picture, with black space around it.
+
+Both options apply to windowed and fullscreen display and persist across launches.
+With two display heads, each head scales within its half of the window.
+
+**View → VM screen** resizes the window to a requested size in logical points
+per emulated pixel. This is separate from the graphics scaling mode. On Retina
+displays, one logical point typically spans two device pixels.
 
 ### Config side panel
 
