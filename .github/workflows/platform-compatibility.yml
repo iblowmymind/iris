@@ -2,9 +2,31 @@ name: Platform compatibility
 
 on:
   push:
-    branches: [main, mac-changes]
+    branches:
+      - main
+      - mac-changes
+      - all-patches
+      - fb-scaling
+      - mac-gui
+      - mac-network
+      - gfx-fixes
+      - camera-fixes
+      - packaging-fixes
+      - storage-fixes
+      - snapshot-fixes
   pull_request:
-    branches: [main, mac-changes]
+    branches:
+      - main
+      - mac-changes
+      - all-patches
+      - fb-scaling
+      - mac-gui
+      - mac-network
+      - gfx-fixes
+      - camera-fixes
+      - packaging-fixes
+      - storage-fixes
+      - snapshot-fixes
   workflow_dispatch:
 
 permissions:
