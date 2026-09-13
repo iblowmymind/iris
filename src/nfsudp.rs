@@ -108,10 +108,27 @@ impl NfsBacking {
         self.id_to_path.get(&id)
     }
 
-    /// The absolute host path for a fileid. Guaranteed within `root` because the
-    /// relative paths only ever contain validated, normal components.
+    /// Resolve a path without traversing host symlinks. Symlink operations are
+    /// not implemented by this server. Host-side concurrent path replacement
+    /// still requires descriptor-relative operations for complete confinement.
+    fn checked_path(&self, rel: &std::path::Path) -> Option<PathBuf> {
+        let mut path = self.root.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            if !matches!(component, std::path::Component::Normal(_)) { return None; }
+            path.push(component);
+            match std::fs::symlink_metadata(&path) {
+                Ok(md) if md.file_type().is_symlink() => return None,
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && components.peek().is_none() => {},
+                Err(_) => return None,
+            }
+        }
+        Some(path)
+    }
+
     pub fn abs_of(&self, id: u64) -> Option<PathBuf> {
-        self.rel_of(id).map(|rel| self.root.join(rel))
+        self.checked_path(self.rel_of(id)?)
     }
 
     /// Whether `id` is a directory the guest can list.
@@ -149,7 +166,7 @@ impl NfsBacking {
         }
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
-        let abs = self.root.join(&rel);
+        let abs = self.checked_path(&rel)?;
         if !abs.symlink_metadata().is_ok() {
             return None;
         }
@@ -161,7 +178,7 @@ impl NfsBacking {
     /// `..` fileid to match what LOOKUP interns.
     pub fn readdir(&mut self, dirid: u64) -> Option<Vec<(Vec<u8>, u64, Attr)>> {
         let dir_rel = self.rel_of(dirid)?.clone();
-        let abs = self.root.join(&dir_rel);
+        let abs = self.checked_path(&dir_rel)?;
         let mut out = Vec::new();
         for (name, id) in [(b".".to_vec(), dirid), (b"..".to_vec(), self.parent_id(dirid)?)] {
             if let Some(attr) = self.attr(id) {
@@ -214,7 +231,7 @@ impl NfsBacking {
         let mut f = std::fs::OpenOptions::new().write(true).open(&abs).ok()?;
         f.seek(SeekFrom::Start(offset)).ok()?;
         f.write_all(data).ok()?;
-        f.flush().ok()?;
+        f.sync_all().ok()?;
         self.attr(id)
     }
 
@@ -232,7 +249,7 @@ impl NfsBacking {
     pub fn create(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
-        let abs = self.root.join(&rel);
+        let abs = self.checked_path(&rel)?;
         std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&abs).ok()?;
         Some(self.intern(rel))
     }
@@ -241,7 +258,7 @@ impl NfsBacking {
     pub fn mkdir(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
-        std::fs::create_dir(self.root.join(&rel)).ok()?;
+        std::fs::create_dir(self.checked_path(&rel)?).ok()?;
         Some(self.intern(rel))
     }
 
@@ -259,7 +276,7 @@ impl NfsBacking {
         let Some(comp) = valid_component(name) else { return false };
         let Some(parent) = self.rel_of(dirid) else { return false };
         let rel = parent.join(&comp);
-        let abs = self.root.join(&rel);
+        let Some(abs) = self.checked_path(&rel) else { return false };
         let ok = if dir { std::fs::remove_dir(&abs) } else { std::fs::remove_file(&abs) }.is_ok();
         if ok {
             if let Some(id) = self.path_to_id.remove(&rel) {
@@ -279,13 +296,26 @@ impl NfsBacking {
         };
         let from_rel = fp.join(&fc);
         let to_rel = tp.join(&tc);
-        if std::fs::rename(self.root.join(&from_rel), self.root.join(&to_rel)).is_err() {
+        let (Some(from), Some(to)) = (self.checked_path(&from_rel), self.checked_path(&to_rel)) else { return false };
+        if std::fs::rename(from, to).is_err() {
             return false;
         }
-        // Re-point the moved id at its new path so its handle stays valid.
-        if let Some(id) = self.path_to_id.remove(&from_rel) {
-            self.id_to_path.insert(id, to_rel.clone());
-            self.path_to_id.insert(to_rel, id);
+        if from_rel == to_rel { return true; }
+        // Keep handles for descendants of a moved directory valid, and retire
+        // handles to the destination that rename replaced.
+        let replaced: Vec<_> = self.id_to_path.iter().filter(|(_, p)| p.starts_with(&to_rel))
+            .map(|(&id, p)| (id, p.clone())).collect();
+        for (id, path) in replaced {
+            self.id_to_path.remove(&id);
+            self.path_to_id.remove(&path);
+        }
+        let moved: Vec<_> = self.id_to_path.iter().filter_map(|(&id, p)| {
+            p.strip_prefix(&from_rel).ok().map(|suffix| (id, p.clone(), to_rel.join(suffix)))
+        }).collect();
+        for (id, old, new) in moved {
+            self.path_to_id.remove(&old);
+            self.id_to_path.insert(id, new.clone());
+            self.path_to_id.insert(new, id);
         }
         true
     }
@@ -1450,6 +1480,37 @@ fn is_idempotent(call: &RpcCall) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_rename_preserves_descendant_handles() {
+        let root = temp_export();
+        std::fs::create_dir(root.join("before")).unwrap();
+        std::fs::write(root.join("before/file"), b"data").unwrap();
+        let mut b = NfsBacking::new(&root);
+        let dir = b.lookup(ROOT_ID, b"before").unwrap();
+        let file = b.lookup(dir, b"file").unwrap();
+        assert!(b.rename(ROOT_ID, b"before", ROOT_ID, b"after"));
+        assert_eq!(b.lookup(ROOT_ID, b"after"), Some(dir));
+        assert_eq!(b.read(file, 0, 4).unwrap().0, b"data");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_symlinks_cannot_escape_export() {
+        let root = temp_export();
+        let outside = temp_export();
+        std::fs::write(outside.join("file"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), root.join("file")).unwrap();
+        let mut b = NfsBacking::new(&root);
+        assert!(b.lookup(ROOT_ID, b"link").is_none());
+        assert!(b.lookup(ROOT_ID, b"file").is_none());
+        assert!(b.create(ROOT_ID, b"file").is_none());
+        assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"untouched");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Unique temp export dir (no external tempfile crate).
