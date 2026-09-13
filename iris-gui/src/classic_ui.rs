@@ -426,6 +426,18 @@ impl App {
                 });
                 ui.label(RichText::new("Ctrl+= / Ctrl+- / Ctrl+0 to zoom").weak().small());
                 ui.separator();
+                ui.menu_button("Graphics scaling", |ui| {
+                    let mut changed = false;
+                    changed |= ui.selectable_value(&mut self.prefs.display_scaling,
+                        settings::DisplayScaling::NearestInteger, "Nearest integer").changed();
+                    changed |= ui.selectable_value(&mut self.prefs.display_scaling,
+                        settings::DisplayScaling::Stretch, "Stretch").changed();
+                    changed |= ui.add_enabled(
+                        self.prefs.display_scaling == settings::DisplayScaling::Stretch,
+                        egui::Checkbox::new(&mut self.prefs.keep_aspect_ratio, "Keep aspect ratio")
+                    ).changed();
+                    if changed { let _ = self.prefs.save(); }
+                });
                 ui.horizontal(|ui| {
                     ui.label("VM screen");
                     // Sets the emulated-display magnification directly (1× =
