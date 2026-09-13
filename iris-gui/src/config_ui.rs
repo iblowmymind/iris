@@ -32,6 +32,8 @@ pub struct PcapIface {
     pub up: bool,
     pub running: bool,
     pub loopback: bool,
+    /// Wi-Fi — bridging cannot work over one. See `iris::net_pcap::is_wireless`.
+    pub wireless: bool,
 }
 
 impl PcapIface {
@@ -42,6 +44,7 @@ impl PcapIface {
         if self.up { tags.push("up"); }
         if self.running { tags.push("running"); }
         if self.loopback { tags.push("loopback"); }
+        if self.wireless { tags.push("Wi-Fi \u{2014} cannot bridge"); }
         if !tags.is_empty() {
             s.push_str(&format!("  [{}]", tags.join(",")));
         }
@@ -73,6 +76,7 @@ pub fn enumerate_pcap_ifaces() -> Result<Vec<PcapIface>, String> {
                     up: i.up,
                     running: i.running,
                     loopback: i.loopback,
+                    wireless: i.wireless,
                 })
                 .collect()
         })
@@ -1282,6 +1286,32 @@ fn pcap_interface_picker(
     // Show an inline error if enumeration failed.
     if let Some(Err(e)) = pcap_ifaces {
         ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), format!("Interface list unavailable: {e}"));
+    }
+
+    // Wi-Fi cannot carry a bridge, and it fails in a way that looks like it
+    // works: the host can reach the guest (that traffic never leaves the
+    // machine), so the only symptom is that nothing *else* on the LAN can.
+    // Worth saying loudly at the point of choice rather than leaving the user
+    // to discover it from the other end of a network.
+    let selected_wireless = match (pcap_ifaces, &cfg.network.pcap_interface) {
+        (Some(Ok(list)), Some(name)) if !name.is_empty() => list
+            .iter()
+            .find(|i| &i.name == name)
+            .is_some_and(|i| i.wireless),
+        _ => false,
+    };
+    if selected_wireless {
+        ui.colored_label(
+            Color32::from_rgb(0xe0, 0x60, 0x60),
+            "This is a Wi-Fi interface \u{2014} bridging cannot work over it.",
+        );
+        ui.label(RichText::new(
+            "An 802.11 association belongs to one MAC address, so the access point drops \
+             frames carrying the guest's MAC on the way out and never delivers the guest's \
+             traffic on the way in. It looks half-working: this machine can ping and telnet \
+             the guest, because that traffic never leaves it, but nothing else on the \
+             network can reach it. Bridging needs a wired interface \u{2014} otherwise use \
+             the NAT gateway.").weak());
     }
 
     (action, committed)

@@ -185,8 +185,12 @@ Caveats:
 - No NAT services (DHCP/DNS/NFS/port-forward) are provided in PCAP mode — the
   guest uses the real network's services. Configure IRIX networking for your
   LAN accordingly.
-- Wired bridges work best. Many Wi-Fi access points reject the guest's extra
-  MAC address, so bridging onto a wireless interface may not pass traffic.
+- **Wired only.** Bridging over Wi-Fi does not work, and fails misleadingly:
+  the *host* can ping and telnet the guest (that traffic never leaves the
+  machine) while nothing else on the LAN can reach it at all. An 802.11
+  association belongs to one MAC address, so the AP drops frames carrying the
+  guest's MAC outbound and never delivers its traffic inbound. See
+  `rules/irix/pcap-bridging-needs-a-wired-nic.md`.
 - The guest still needs its MAC set in NVRAM (`setenv -f eaddr ...`; see
   `rules/irix/networking.md`).
 
