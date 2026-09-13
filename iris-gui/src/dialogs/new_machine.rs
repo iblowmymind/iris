@@ -77,11 +77,7 @@ impl NewMachineDialog {
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.open { return; }
         let mut close = false;
-        egui::Window::new("New machine")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+        let closed = crate::oswindow::show(ctx, "new_machine", "New machine", [500.0, 560.0], false, |ui| {
                 ui.set_min_width(440.0);
                 ui.label(RichText::new("Configure a new SGI machine").strong());
                 ui.add_space(4.0);
@@ -281,6 +277,6 @@ impl NewMachineDialog {
                     }
                 });
             });
-        if close { self.open = false; }
+        if close || closed { self.open = false; }
     }
 }
