@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - mac-changes
       - all-patches
       - fb-scaling
       - mac-gui
@@ -16,7 +15,6 @@ on:
   pull_request:
     branches:
       - main
-      - mac-changes
       - all-patches
       - fb-scaling
       - mac-gui
