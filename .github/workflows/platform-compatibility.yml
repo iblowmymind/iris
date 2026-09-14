@@ -9,7 +9,6 @@ on:
       - fb-scaling
       - mac-gui
       - mac-network
-      - gfx-fixes
       - camera-fixes
       - packaging-fixes
       - storage-fixes
@@ -22,7 +21,6 @@ on:
       - fb-scaling
       - mac-gui
       - mac-network
-      - gfx-fixes
       - camera-fixes
       - packaging-fixes
       - storage-fixes
