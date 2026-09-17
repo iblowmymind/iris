@@ -64,16 +64,11 @@ impl CameraTest {
                     let field = cam.next_field();
                     let rgba = uyvy_field_to_rgba(&field);
                     let status = cam.status();
-                    // The camera is opened on the source's own thread, after
-                    // CameraSource::new has already returned Ok — so a failure
-                    // to open (permission denied, no device) shows up here, not
-                    // as an Err above. Without this the preview was just black.
-                    let error = cam.error();
                     let mut g = s2.lock();
                     g.status = status;
                     g.frame = Some((field.width, field.height, rgba));
                     g.seq = g.seq.wrapping_add(1);
-                    g.error = error;
+                    g.error = None;
                 }
                 // `cam` drops here → camera stream closed, device released.
             })

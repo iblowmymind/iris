@@ -6,7 +6,6 @@ on:
       - main
       - all-patches
       - mac-gui
-      - camera-fixes
       - packaging-fixes
       - storage-fixes
       - snapshot-fixes
@@ -15,7 +14,6 @@ on:
       - main
       - all-patches
       - mac-gui
-      - camera-fixes
       - packaging-fixes
       - storage-fixes
       - snapshot-fixes

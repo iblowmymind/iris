@@ -1290,8 +1290,6 @@ fn pcap_interface_picker(
 fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     let mut action = ConfigAction::None;
     ui.heading("Video-In (IndyCam)");
-    ui.label(RichText::new("Video-In changes apply at the next VM Start. Test Camera previews the selected settings immediately.").weak());
-    ui.label(RichText::new("In IRIX, select the IndyCam input. Composite video supplies a black picture.").weak());
     Grid::new("vino_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Source");
         ComboBox::from_id_salt("vino_src")
