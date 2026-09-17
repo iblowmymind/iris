@@ -38,11 +38,7 @@ impl CreateDiskDialog {
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.open { return; }
         let mut close = false;
-        egui::Window::new(format!("Create blank HDD image for SCSI #{}", self.scsi_id))
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+        let closed = crate::oswindow::show(ctx, "create_disk", &format!("Create blank HDD image for SCSI #{}", self.scsi_id), [440.0, 300.0], false, |ui| {
                 ui.set_min_width(380.0);
                 Grid::new("create_disk_grid").num_columns(2).striped(true).show(ui, |ui| {
                     ui.label("Filename");
@@ -113,6 +109,6 @@ impl CreateDiskDialog {
                     }
                 });
             });
-        if close { self.open = false; }
+        if close || closed { self.open = false; }
     }
 }

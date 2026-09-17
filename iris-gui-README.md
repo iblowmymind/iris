@@ -61,7 +61,7 @@ cargo build -p iris-gui --release --features iris/jitv2
   `iris/debug_cache` — various core tweaks. `iris/r5ksc` and
   `iris/r5ksc_triton` refuse to build.
 
-**Help → Diagnostics** lists what's compiled in.
+**Help → About IRIS** lists what's compiled in.
 
 ### Verify that the default iris build is unaffected
 
@@ -105,27 +105,38 @@ work.
 
 ### Layout
 
-The window is split into a **control column** on the left and the **emulator
-screen** on the right. The screen shows the live framebuffer once a machine is
-running (with an overlay while it is powered off). The **VM screen** scale in
-the View menu is the maximum draw scale: a larger window (fullscreen, maximised,
-resized) centres the picture at that scale, and only a smaller window shrinks it
-to fit.
+The layout depends on the platform.
 
-The control column holds, top to bottom: the drop-down menus, the capture
-button and hint, the configuration editor, and a status footer (run state,
-machine name, MIPS readout, and the **NET** light for the internal network).
+**Windows and Linux** use a **control column** on the left and the **emulator
+screen** on the right (`src/classic_ui.rs`). The control column holds, top to
+bottom: the drop-down menus, machine controls, the capture button and hint, the
+configuration editor, and a status footer (run state, machine name, MIPS
+readout, and the **NET** light for the internal network).
+
+**macOS** puts the menus in the **system menu bar** (`src/menus.rs`). Once a
+machine is running, the window holds the emulator screen and nothing else. The
+configuration editor and every dialog are **separate windows**, so they can go
+on another monitor and never cover the picture. The run state lives in the
+**window title**: machine name, PROM / IRIX running / halted / stopped, MIPS,
+networking, on-screen scale, capture state, and the most recent notification,
+refreshed about four times a second.
+
+On every platform the screen shows the live framebuffer once a machine is
+running (with an overlay while it is powered off), and the welcome / status
+panel while idle. The **VM screen** scale in the View menu is the maximum draw
+scale: a larger window (fullscreen, maximised, resized) centres the picture at
+that scale, and only a smaller window shrinks it to fit.
 
 ### Menus
 
 | Menu | Contents |
 | --- | --- |
-| **File** | New machine… / Switch to machine / Import iris.toml… / Export current to iris.toml… / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
-| **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (R4400 or R5000, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
+| **File** | New machine… / Switch to machine / Configuration… (macOS, ⌘,) / Import iris.toml… / Export current to iris.toml… / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
+| **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (R4400 or R5000, applies at next Start) / Save and Restore state (slots snap1–4) / Screenshot… / Serial console… / Capture mouse & keyboard |
 | **Memory** | Total presets, plus per-bank submenus |
 | **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions, plus per-disk **Commit changes to disk** / **Discard changes** for COW overlays and CHD diffs while stopped |
-| **View** | Fullscreen (F11), UI scale, VM screen scale |
-| **Help** | Version, Diagnostics (build features), Serial console…, How camera & networking work, Mount the shared folder in IRIX, N64 development board, Licenses, Privacy policy |
+| **View** | Fullscreen (F11), emulator (VM screen) scale, menu and dialog scale; on Windows and Linux, the configuration tabs |
+| **Help** | Diagnostics (Test Camera, Serial console…), How camera & networking work, Mount the shared folder in IRIX, N64 development board, Licenses, Privacy policy, About IRIS (version and build features) |
 
 The **SCSI** menu is the recommended way to attach / detach / replace
 drives. Each ID shows its current state inline:
@@ -138,6 +149,11 @@ CD-ROM changes apply to a running guest: loading or ejecting a disc signals
 IRIX with a media-change Unit Attention, no restart needed.
 
 ### Configuration tabs
+
+On macOS, **File → Configuration…** (⌘,) opens the tabbed editor in a separate
+window. On Windows and Linux, use **Edit config…** in the sidebar or pick a tab
+from **View**; the editor fills the central pane while stopped, or opens in a
+side panel beside the running display. The editor starts closed on each launch.
 
 | Tab | What's there |
 | --- | --- |
@@ -164,6 +180,11 @@ position**, so IRIX's own `keybd` layout applies on top.
 | **Ctrl+Alt+F11** | Send F11 to IRIX |
 | **Ctrl/Cmd+F12** | Pick a disc and load it into the first CD-ROM drive |
 | **Ctrl/Cmd + =**, **−**, **0** | Zoom UI in / out / reset |
+| **Ctrl/Cmd+R**, **Shift+Ctrl/Cmd+R** | Start / stop the machine |
+| **Ctrl/Cmd+K** | Capture or release mouse and keyboard |
+| **Ctrl/Cmd+F** | Fullscreen |
+| **Ctrl/Cmd+,** | Configuration |
+| **Ctrl/Cmd+N**, **Ctrl/Cmd+Q** | New machine / quit |
 
 Ctrl+C / Ctrl+X / Ctrl+V reach the guest while captured (egui would otherwise
 turn them into clipboard commands), and switching away from the window releases
@@ -171,11 +192,11 @@ capture after a short grace period.
 
 ### Serial console and networking help
 
-**Serial console…** (Machine and Help menus) opens an in-app IRIX serial console
-(a client of `127.0.0.1:8881`). Networking has a "check / fix guest networking" flow that compares `ec0`
-against the NAT subnet and can issue the IRIX commands to fix it, and a mount
-helper that shows the exact `mount` command for the NFS share (including the
-PCAP-mode NFS IP).
+**Serial console…** (Machine menu, and Help → Diagnostics) opens an in-app IRIX
+serial console (a client of `127.0.0.1:8881`). Networking has a "check / fix
+guest networking" flow that compares `ec0` against the NAT subnet and can issue
+the IRIX commands to fix it, and a mount helper that shows the exact `mount`
+command for the NFS share (including the PCAP-mode NFS IP).
 
 ---
 
@@ -316,7 +337,11 @@ iris/
     ├── build.rs       APP_VERSION (from RELEASE_VERSION or the crate version)
     ├── assets/        icons, default NVRAM
     └── src/
-        ├── main.rs            App: control column, menus, modals, update loop
+        ├── main.rs            App, platform layout, modals, update loop
+        ├── classic_ui.rs      Windows/Linux control column and embedded configuration
+        ├── menus.rs           menu definitions (macOS system menu bar)
+        ├── macos_menu.rs      AppKit menu bar glue
+        ├── oswindow.rs        separate OS windows for dialogs (macOS)
         ├── handle.rs          EmulatorHandle: worker thread, Cmd/Evt channels
         ├── framebuffer.rs     CaptureRenderer + FrameSink (REX3 → egui texture)
         ├── input.rs           capture, egui → PS/2 keyboard+mouse pump
@@ -391,7 +416,7 @@ enum Evt { Started, Stopped, PowerOff, StateSaved(name), StateRestored(name),
 `src/lib.rs` exposes `iris::build_features` (`CHD`, `CAMERA`, `PCAP`, `JITV2`,
 `REX_JIT`, `ULTRA64`, `DAYNAPORT`, `LIGHTNING`, `IDLE_PAUSE`, plus `enabled()`
 and `banner()` for the full list). iris-gui reads these to list the build in
-Help → Diagnostics, hide the Debug tab in lightning builds, gate the DaynaPort,
+Help → About IRIS, hide the Debug tab in lightning builds, gate the DaynaPort,
 PCAP and Ultra64 controls, and label the camera source. The emulated CPU is not
 a build feature — read `MachineConfig::machine.cpu`.
 
