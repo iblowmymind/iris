@@ -7,20 +7,9 @@
 # do — and the Terminal window stays closed.
 #
 # Usage:
-#   ./scripts/build-macos.sh                  # standard build
-#   ./scripts/build-macos.sh lightning        # enable iris/lightning feature
-#   ./scripts/build-macos.sh appstore         # SANDBOXED build (App Store parity)
-#   ./scripts/build-macos.sh lightning pcap   # ...plus bridged networking
-#   ./scripts/build-macos.sh lightning pcap jitv2 # ...plus experimental MIPS JIT v2
-#
-# `pcap` adds bridged (PCAP) networking, which puts the guest on your real LAN
-# as its own L2 host instead of behind the built-in NAT gateway. Without it the
-# Network tab has no backend selector at all — the option is compiled out, not
-# hidden — so this is what makes bridged networking selectable. It costs
-# nothing extra to build on macOS (libpcap is in the SDK); capturing needs a
-# one-time admin install of ChmodBPF, which the app offers from the Network tab
-# on first use. It combines with any variant except the sandboxed ones, where
-# it can neither work nor ship (see below).
+#   ./scripts/build-macos.sh            # standard build
+#   ./scripts/build-macos.sh lightning  # enable iris/lightning feature
+#   ./scripts/build-macos.sh appstore   # SANDBOXED build (App Store parity)
 #
 # The `appstore` variant compiles `--features appstore` (so the real
 # security-scoped bookmark code + IRIS_CHD_DIFF_DIR are active, not the
@@ -35,44 +24,7 @@
 
 set -e
 
-# Options are order-independent: one variant, plus any number of add-ons.
-VARIANT="standard"
-WANT_PCAP=0
-WANT_JITV2=0
-for arg in "$@"; do
-    case "$arg" in
-        standard|lightning|appstore|sandbox) VARIANT="$arg" ;;
-        pcap) WANT_PCAP=1 ;;
-        jitv2) WANT_JITV2=1 ;;
-        *)
-            echo "unknown option: $arg" >&2
-            echo "usage: $0 [standard|lightning|appstore] [pcap] [jitv2]" >&2
-            exit 1
-            ;;
-    esac
-done
-
-SANDBOXED=0
-if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
-    SANDBOXED=1
-fi
-
-# PCAP can't ship in a sandboxed build and wouldn't work in one: the capture
-# device needs an admin install the sandbox forbids, and a backend the user
-# can select but never use is exactly the kind of dangling option App Review
-# rejects. Refuse the combination rather than building something misleading.
-if [ "$WANT_PCAP" = 1 ] && [ "$SANDBOXED" = 1 ]; then
-    echo "error: pcap and the sandboxed ($VARIANT) variant are incompatible." >&2
-    echo "       The App Store build has no bridged networking by design." >&2
-    exit 1
-fi
-
-# The sandboxed app forces interpreter-only execution.
-if [ "$WANT_JITV2" = 1 ] && [ "$SANDBOXED" = 1 ]; then
-    echo "error: jitv2 and the sandboxed ($VARIANT) variant are incompatible." >&2
-    echo "       The App Store build disables JIT execution." >&2
-    exit 1
-fi
+VARIANT="${1:-standard}"
 
 # ── Architecture ────────────────────────────────────────────────────────────
 
@@ -104,25 +56,13 @@ echo "  Bundle ID: $BUNDLE_ID"
 
 # ── Build ───────────────────────────────────────────────────────────────────
 
-FEATURES=""
-add_feature() { FEATURES="${FEATURES:+$FEATURES,}$1"; }
-
-case "$VARIANT" in
-    lightning) add_feature "iris/lightning" ;;
-    appstore|sandbox)
-        # Sandbox parity: enable the bookmark code + container diff redirect.
-        # lightning gives a usable interpreter (the appstore feature forces
-        # IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
-        add_feature "appstore"
-        add_feature "iris/lightning"
-        ;;
-esac
-[ "$WANT_PCAP" = 1 ] && add_feature "pcap"
-[ "$WANT_JITV2" = 1 ] && add_feature "iris/jitv2"
-
-echo "  Features: ${FEATURES:-(default)}"
-if [ -n "$FEATURES" ]; then
-    cargo build --release --target "$TARGET" -p iris-gui --features "$FEATURES"
+if [ "$VARIANT" = "lightning" ]; then
+    cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning
+elif [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
+    # Sandbox parity: enable the bookmark code + container diff redirect.
+    # lightning gives a usable interpreter (the appstore feature forces
+    # IRIS_NO_JIT, so the MIPS/REX JITs are off regardless).
+    cargo build --release --target "$TARGET" -p iris-gui --features appstore,iris/lightning
 else
     cargo build --release --target "$TARGET" -p iris-gui
 fi
@@ -161,47 +101,28 @@ cat > "${BUNDLE}/Contents/Info.plist" << EOF
     <key>NSHighResolutionCapable</key><true/>
     <key>LSMinimumSystemVersion</key><string>10.13</string>
     <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
-    <key>NSAppleEventsUsageDescription</key><string>Runs the one-time administrator install that grants IRIS access to packet capture (bridged networking).</string>
 </dict>
 </plist>
 EOF
 
 # ── Sign ────────────────────────────────────────────────────────────────────
 
-# The sandboxed variant signs with the local sandbox entitlements (app-sandbox).
-# Everything else signs with the *notarized* (Developer ID) entitlements — the
-# same file release.yml uses for the DMG, so a local build behaves like the one
-# users download. It used to use installer/iris-gui.entitlements, which is the
-# Mac App Store file: that carries com.apple.security.app-sandbox, so a plain
-# local build came out sandboxed while the `appstore` feature — and with it the
-# security-scoped bookmark code in macos_sandbox.rs — was NOT compiled in. The
-# result was a bundle that could not reach a disk image outside its container
-# on the next launch, for a variant that was never meant to be sandboxed at all.
-# Use `./scripts/build-macos.sh appstore` when you actually want the sandbox.
-# CODESIGN_IDENTITY overrides the default ad-hoc identity (e.g. a Developer ID
-# for persistent bookmarks).
+# The sandboxed variant signs with the local sandbox entitlements (app-sandbox);
+# other variants keep the existing behaviour. CODESIGN_IDENTITY overrides the
+# default ad-hoc identity (e.g. a Developer ID for persistent bookmarks).
 SIGN_ID="${CODESIGN_IDENTITY:--}"
-if [ "$SANDBOXED" = 1 ]; then
+if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
     ENTITLEMENTS="installer/iris-gui-sandbox-local.entitlements"
 else
-    ENTITLEMENTS="installer/iris-gui-notarized.entitlements"
+    ENTITLEMENTS="installer/iris-gui.entitlements"
 fi
 
 echo "Signing bundle (identity: ${SIGN_ID}, entitlements: ${ENTITLEMENTS})..."
 if [ -f "$ENTITLEMENTS" ]; then
-    # Validate first: codesign's entitlements parser is strict, and a parse
-    # failure would otherwise leave the bundle unsigned / un-sandboxed without
-    # an obvious error. `plutil -lint` alone is NOT enough: it accepts a double
-    # hyphen inside an XML comment, which is illegal XML and which AMFI rejects
-    # with "Failed to parse entitlements: AMFIUnserializeXML: syntax error".
-    # Comments in these files must not contain `-` twice in a row (write
-    # "the runtime codesign option", not the flag itself).
+    # Validate first: codesign's entitlements parser is strict (and an XML
+    # comment may not contain a double hyphen), and a parse failure would
+    # otherwise leave the bundle unsigned / un-sandboxed without an obvious error.
     plutil -lint "$ENTITLEMENTS" >/dev/null
-    if sed 's/<!--//g; s/-->//g' "$ENTITLEMENTS" | grep -q -- '--'; then
-        echo "error: $ENTITLEMENTS has a double hyphen inside a comment;" >&2
-        echo "       AMFI will refuse to parse it. Reword the comment." >&2
-        exit 1
-    fi
     codesign --force --deep --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "${BUNDLE}"
 else
     codesign --force --deep --sign "$SIGN_ID" "${BUNDLE}"
@@ -215,15 +136,7 @@ echo "  open ${BUNDLE}"
 echo ""
 echo "Or double-click IRIS.app in Finder."
 
-if [ "$WANT_PCAP" = 1 ]; then
-    echo ""
-    echo "Bridged networking is compiled in. In the app: View -> Configuration,"
-    echo "Network tab -> Backend -> \"PCAP (bridged)\". Capturing needs access to"
-    echo "/dev/bpf*, so the first attempt offers a one-time admin ChmodBPF install;"
-    echo "quit and reopen IRIS afterwards for the new group membership to apply."
-fi
-
-if [ "$SANDBOXED" = 1 ]; then
+if [ "$VARIANT" = "appstore" ] || [ "$VARIANT" = "sandbox" ]; then
     echo ""
     echo "This is a SANDBOXED build. Verify the sandbox is actually on:"
     echo "  codesign -d --entitlements - ${BUNDLE} 2>/dev/null | grep -A1 app-sandbox"
