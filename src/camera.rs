@@ -41,6 +41,13 @@ pub(crate) struct Shared {
     pub frame_count: u64,
     /// Capture resolution reported by the backend once streaming starts.
     pub capture_res: Option<(u32, u32)>,
+    /// Why capture isn't running, if it isn't: permission denied, no device,
+    /// open failed. The worker thread is spawned before the camera is opened —
+    /// a failure to open happens on that thread, after `CameraSource::new` has
+    /// already returned Ok — so without somewhere to put it, the only symptom
+    /// is a black picture and a line on stderr nobody sees. Cleared once frames
+    /// start arriving.
+    pub error: Option<String>,
 }
 
 // ─── CameraSource ────────────────────────────────────────────────────────────
@@ -72,6 +79,7 @@ impl CameraSource {
             next_parity: FieldParity::Even,
             frame_count: 0,
             capture_res: None,
+            error:       None,
         }));
         let s2 = shared.clone();
         let running = Arc::new(AtomicBool::new(true));
@@ -83,6 +91,14 @@ impl CameraSource {
             .map_err(|e| format!("camera worker spawn failed: {}", e))?;
 
         Ok(Self { standard, shared, running, worker: Some(worker) })
+    }
+}
+
+impl CameraSource {
+    /// Why capture isn't running, if it isn't — permission denied, no device,
+    /// open failed. `None` while it is working (or still opening).
+    pub fn error(&self) -> Option<String> {
+        self.shared.lock().error.clone()
     }
 }
 
@@ -108,8 +124,12 @@ impl VideoSource for CameraSource {
             None         => "pending".to_string(),
         };
         let (fw, fh) = self.standard.field_size();
-        format!("frames={} capture={} output={}×{} standard={:?}",
-            s.frame_count, res, fw, fh * 2, self.standard)
+        let err = match &s.error {
+            Some(e) => format!(" error=\"{e}\""),
+            None => String::new(),
+        };
+        format!("frames={} capture={} output={}×{} standard={:?}{}",
+            s.frame_count, res, fw, fh * 2, self.standard, err)
     }
 
     fn next_field(&self) -> Field {
@@ -145,6 +165,14 @@ impl VideoSource for CameraSource {
 }
 
 // ─── Shared helpers (used by both backends) ──────────────────────────────────
+
+/// Record why capture isn't running, and say it on stderr once. Backends call
+/// this instead of a bare `eprintln!` so the GUI and `vino status` can show it.
+pub(crate) fn report_error(shared: &Mutex<Shared>, msg: impl Into<String>) {
+    let msg = msg.into();
+    eprintln!("camera: {msg}");
+    shared.lock().error = Some(msg);
+}
 
 pub(crate) fn black_field(w: u32, h: u32) -> Arc<[u8]> {
     let mut buf = vec![0u8; (w * h * 2) as usize];
