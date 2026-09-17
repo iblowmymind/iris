@@ -1,3 +1,4 @@
+#[cfg(any(not(target_os = "macos"), test))]
 use eframe::egui::{RichText, Ui};
 use iris::config::{MachineConfig, ScsiDeviceConfig};
 use std::path::Path;
@@ -5,19 +6,23 @@ use std::path::Path;
 /// What the user picked from a SCSI submenu, deferred for the App to act on
 /// (so we don't hold &mut MachineConfig across nested closures and dialogs).
 pub enum ScsiAction {
+    #[cfg(any(not(target_os = "macos"), test))]
     None,
     AttachHdd { id: u8, path: String },
     AttachEmptyCdrom { id: u8 },
     AttachCdromWithDisc { id: u8, path: String },
     InsertDisc { id: u8, path: String },
     Eject { id: u8 },
+    #[cfg(any(not(target_os = "macos"), test))]
     RemountInIrix { id: u8 },
     Detach { id: u8 },
+    #[cfg(any(not(target_os = "macos"), test))]
     CreateBlank { id: u8 },
     ToggleOverlay { id: u8 },
 }
 
 /// Build the top-level "SCSI" menu. Returns at most one action per frame.
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
     let mut action = ScsiAction::None;
     ui.set_min_width(280.0);
@@ -122,7 +127,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
     action
 }
 
-fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
+pub fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
     match dev {
         None => format!("SCSI #{id}: (empty)"),
         Some(d) if d.is_daynaport() => format!("SCSI #{id}: DaynaPort (Ethernet)"),
@@ -162,7 +167,7 @@ fn dialog_at(title: &str, cur: &str) -> rfd::FileDialog {
                               crate::filedialog::Purpose::Open)
 }
 
-fn pick_disk(title: &str, cur: &str) -> Option<String> {
+pub fn pick_disk(title: &str, cur: &str) -> Option<String> {
     dialog_at(title, cur)
         .add_filter("Disk images", &["raw", "img", "chd"])
         .add_filter("All", &["*"])
@@ -181,6 +186,7 @@ pub fn pick_iso(title: &str, cur: &str) -> Option<String> {
 /// Apply an action to the config.
 pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
     match action {
+        #[cfg(any(not(target_os = "macos"), test))]
         ScsiAction::None => None,
         ScsiAction::AttachHdd { id, path } => {
             cfg.scsi.insert(id, ScsiDeviceConfig { path, ..Default::default() });
@@ -208,6 +214,7 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
             cfg.scsi.remove(&id);
             Some(format!("scsi{id}: detached"))
         }
+        #[cfg(any(not(target_os = "macos"), test))]
         ScsiAction::CreateBlank { .. } => {
             // App opens the CreateDiskDialog; nothing to apply yet.
             None
@@ -216,6 +223,7 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
             if let Some(d) = cfg.scsi.get_mut(&id) { d.overlay = !d.overlay; }
             Some(format!("scsi{id}: overlay toggled"))
         }
+        #[cfg(any(not(target_os = "macos"), test))]
         ScsiAction::RemountInIrix { .. } => None,
     }
 }
