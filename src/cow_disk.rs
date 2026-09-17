@@ -69,12 +69,16 @@ fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
     if !path.exists() { return Ok(HashSet::new()); }
     let mut f = File::open(path)?;
     let mut count_buf = [0u8; 8];
-    if f.read_exact(&mut count_buf).is_err() { return Ok(HashSet::new()); }
-    let count = u64::from_le_bytes(count_buf) as usize;
+    f.read_exact(&mut count_buf)?;
+    let count = u64::from_le_bytes(count_buf);
+    if count.checked_mul(8).and_then(|n| n.checked_add(8)) != Some(f.metadata()?.len()) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid COW dirty-sector sidecar length"));
+    }
+    let count = usize::try_from(count).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "COW dirty-sector count too large"))?;
     let mut set = HashSet::with_capacity(count);
     let mut buf = [0u8; 8];
     for _ in 0..count {
-        if f.read_exact(&mut buf).is_err() { break; }
+        f.read_exact(&mut buf)?;
         set.insert(u64::from_le_bytes(buf));
     }
     Ok(set)
@@ -93,11 +97,16 @@ fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })?.sync_all()?;
+    }
     Ok(())
 }
 
 pub struct CowDisk {
     base: File,
+    base_path: PathBuf,
     overlay: File,
     dirty: HashSet<u64>,
     base_size: u64,
@@ -126,7 +135,11 @@ impl CowDisk {
         // file has some bytes here" (sparse allocation can contain partial
         // writes from an interrupted run, which can't be trusted).
         let sidecar = dirty_sidecar_path(overlay_path);
-        let dirty = load_dirty_sidecar(&sidecar).unwrap_or_default();
+        let dirty = load_dirty_sidecar(&sidecar)?;
+        let overlay_size = overlay.metadata()?.len();
+        if dirty.iter().any(|&lba| lba >= base_size / SECTOR_SIZE || lba >= overlay_size / SECTOR_SIZE) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "COW dirty sector exceeds disk or overlay size"));
+        }
 
         eprintln!("iris: COW overlay active (base: {}, overlay: {}, dirty sectors: {})",
                   base_path, overlay_path, dirty.len());
@@ -138,6 +151,7 @@ impl CowDisk {
 
         Ok(Self {
             base,
+            base_path: std::fs::canonicalize(base_path)?,
             overlay,
             dirty,
             base_size,
@@ -148,7 +162,9 @@ impl CowDisk {
     /// Read `count` sectors starting at `lba`.
     /// Dirty sectors are read from the overlay, clean sectors from the base.
     pub fn read_sectors(&mut self, lba: u64, count: usize) -> io::Result<Vec<u8>> {
-        let total = count * SECTOR_SIZE as usize;
+        self.check_range(lba, count)?;
+        let total = count.checked_mul(SECTOR_SIZE as usize).ok_or_else(||
+            io::Error::new(io::ErrorKind::InvalidInput, "COW read length overflow"))?;
         let mut data = vec![0u8; total];
 
         // Batch consecutive sectors from the same source to minimize seeks.
@@ -183,8 +199,11 @@ impl CowDisk {
     /// Write sectors starting at `lba`. Data length must be a multiple of 512.
     /// Writes go to the overlay file only; the base image is never modified.
     pub fn write_sectors(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
-        debug_assert!(data.len() % SECTOR_SIZE as usize == 0);
+        if !data.len().is_multiple_of(SECTOR_SIZE as usize) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unaligned COW sector write"));
+        }
         let count = data.len() / SECTOR_SIZE as usize;
+        self.check_range(lba, count)?;
 
         self.overlay.seek(SeekFrom::Start(lba * SECTOR_SIZE))?;
         self.overlay.write_all(data)?;
@@ -193,6 +212,14 @@ impl CowDisk {
             self.dirty.insert(lba + i);
         }
 
+        Ok(())
+    }
+
+    fn check_range(&self, lba: u64, count: usize) -> io::Result<()> {
+        let sectors = self.base_size / SECTOR_SIZE;
+        if lba > sectors || count as u64 > sectors - lba {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "COW request exceeds disk capacity"));
+        }
         Ok(())
     }
 
@@ -205,17 +232,7 @@ impl CowDisk {
     pub fn commit(&mut self) -> io::Result<usize> {
         // Reopen base as read-write for the commit.
         // (We can't just change the mode of self.base, so we open a second handle.)
-        let base_path = {
-            // Get the path from /proc/self/fd on Linux, or just require it as a param.
-            // For simplicity, we'll do the commit through the overlay path convention:
-            // base path = overlay path without the ".overlay" suffix.
-            if self.overlay_path.ends_with(".overlay") {
-                self.overlay_path[..self.overlay_path.len() - 8].to_string()
-            } else {
-                return Err(io::Error::new(io::ErrorKind::Other,
-                    "cannot determine base path from overlay path"));
-            }
-        };
+        let base_path = &self.base_path;
 
         let mut base_rw = OpenOptions::new().read(true).write(true).open(&base_path)?;
         let mut buf = vec![0u8; SECTOR_SIZE as usize];
@@ -230,24 +247,27 @@ impl CowDisk {
         }
 
         base_rw.sync_all()?;
+        // Publish an empty dirty set before truncation, so reopening after a
+        // crash cannot refer to sectors that no longer exist in the overlay.
+        save_dirty_sidecar(&dirty_sidecar_path(&self.overlay_path), &HashSet::new())?;
         self.dirty.clear();
         self.overlay.set_len(0)?;
 
         // Reopen base read-only to pick up committed data.
         self.base = File::open(&base_path)?;
 
-        eprintln!("iris: COW committed {} sectors to {}", committed, base_path);
+        eprintln!("iris: COW committed {} sectors to {}", committed, base_path.display());
         Ok(committed)
     }
 
     /// Delete the overlay file and create a fresh empty one (for state load).
     pub fn reset_overlay(&mut self) -> io::Result<()> {
+        // Publish an empty dirty set before truncation, so reopening after a
+        // crash cannot refer to sectors that no longer exist in the overlay.
+        save_dirty_sidecar(&dirty_sidecar_path(&self.overlay_path), &HashSet::new())?;
         self.dirty.clear();
         self.overlay.set_len(0)?;
         self.overlay.seek(SeekFrom::Start(0))?;
-        // Also clear the sidecar so we don't "remember" sectors that no
-        // longer exist after the truncation.
-        let _ = std::fs::remove_file(dirty_sidecar_path(&self.overlay_path));
         Ok(())
     }
 
@@ -318,6 +338,36 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("iris-cow-{}-{}.{}", tag, nanos, ext))
+    }
+
+    #[test]
+    fn commit_uses_configured_base_and_persists_empty_dirty_set() {
+        let base = unique_tmp("base", "raw");
+        let overlay = unique_tmp("unrelated", "overlay");
+        std::fs::write(&base, vec![0x11; 1024]).unwrap();
+        let mut cow = CowDisk::new(base.to_str().unwrap(), overlay.to_str().unwrap()).unwrap();
+        cow.write_sectors(1, &[0x55; 512]).unwrap();
+        cow.flush().unwrap();
+        assert!(cow.write_sectors(1, &[0xff; 1024]).is_err());
+        assert_eq!(cow.commit().unwrap(), 1);
+        let mut reopened = CowDisk::new(base.to_str().unwrap(), overlay.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.read_sectors(1, 1).unwrap(), vec![0x55; 512]);
+        assert_eq!(reopened.dirty_count(), 0);
+        drop(reopened);
+        drop(cow);
+        std::fs::remove_file(base).unwrap();
+        std::fs::remove_file(dirty_sidecar_path(overlay.to_str().unwrap())).unwrap();
+        std::fs::remove_file(overlay).unwrap();
+    }
+
+    #[test]
+    fn truncated_dirty_sidecar_is_rejected() {
+        let path = unique_tmp("truncated", "dirty");
+        std::fs::write(&path, 2_u64.to_le_bytes()).unwrap();
+        assert!(load_dirty_sidecar(&path).is_err());
+        std::fs::write(&path, u64::MAX.to_le_bytes()).unwrap();
+        assert!(load_dirty_sidecar(&path).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
