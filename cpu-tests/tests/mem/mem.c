@@ -167,10 +167,29 @@ static void t_lwr_all_offsets(void)
          * Both measured on real silicon — R4400 rev 6.0 and R5000 rev 1.0.
          * LWL sign-extends everywhere on both, because it always writes all
          * 32 bits.
+         *
+         * No R4600 has run this. Its integer unit is QED's, like the R5000's,
+         * but that is a guess, not a measurement — so for the R4600 either
+         * measured behaviour passes and the log says which one it showed.
+         * Anything else (a partial load that corrupts the low half, say)
+         * still fails.
          */
-        want = (o == 3 || is_r5000())
-                        ? (u64)(s64)(s32)want32[o]
-                        : ((orig & 0xFFFFFFFF00000000ull) | want32[o]);
+        {
+            u64 upper_kept = (orig & 0xFFFFFFFF00000000ull) | want32[o];
+            u64 sign_ext   = (u64)(s64)(s32)want32[o];
+
+            if (is_r4600() && o != 3) {
+                con_printf("\n      [lwr off=%u on R4600: %s]", o,
+                           v == sign_ext   ? "sign-extends, as an R5000" :
+                           v == upper_kept ? "keeps the upper half, as an R4400" :
+                                             "neither");
+                /* Either answer passes; a mismatch reports against the
+                 * R5000's. */
+                want = (v == upper_kept) ? upper_kept : sign_ext;
+            } else {
+                want = (o == 3 || is_r5000()) ? sign_ext : upper_kept;
+            }
+        }
         CHECK_EQ_AT("off", o, v, want);
     }
 }
@@ -416,6 +435,258 @@ static void t_kseg0_kseg1_alias(void)
     CHECK_EQ(*k0, 0x5EED0000u);
 }
 
+/* ── a load, and the instructions right after it ──────────────────────────── */
+
+/*
+ * A pipelined CPU finds a load's value one stage later than any other result,
+ * so the instruction immediately behind a load is where forwarding goes wrong:
+ * using the loaded register at once, one instruction later, as the base of the
+ * next load, in a branch, as the value of a store that is itself reloaded,
+ * after a second load into the same register, and with the load in a branch
+ * delay slot. None of this is CPU-specific - it is plain ISA semantics - but a
+ * core that stalls every load hides a whole class of bugs that a core which
+ * stalls only when it must can have, so the sequences are spelled out.
+ *
+ * Every sequence runs twice: once with its lines not in the D-cache (the load
+ * waits on a fill) and once with them already cached (the load completes in
+ * the cache's own time), because those are different paths through a core.
+ */
+static void t_load_then_use(void)
+{
+    volatile u64 *q = (volatile u64 *)(_scratch_start + 256);
+    const u64 v0 = 0x0123456789ABCDEFull;
+    const u64 v2 = 0x1122334455667788ull;
+    u64 r;
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        q[0] = v0;
+        q[1] = (u64)(s64)(s32)(unsigned long)&q[2];   /* a KSEG0 pointer, sign-extended */
+        q[2] = v2;
+        q[3] = 0x8000000000000001ull;
+        q[4] = 0;
+        q[5] = 0x80FF7F0100000000ull;                   /* bytes 80 FF 7F 01 ... */
+        SYNC();
+        dcache_wb_invalidate_range(q, 6 * 8);           /* in memory, not in the cache */
+        SYNC();
+        if (pass == 1) {
+            u64 warm = q[0] ^ q[1] ^ q[2] ^ q[3] ^ q[4] ^ q[5];
+            (void)warm;                                  /* now the lines are cached */
+        }
+
+        /* Used by the very next instruction. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tdaddu %0, $8, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("next", pass, r, v0 + v0);
+
+        /* Used two instructions later, with an unrelated one between. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tdaddu $9, $zero, $zero\n\tdaddu %0, $8, $9" Z
+                             : "=r"(r) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("after one", pass, r, v0);
+
+        /* As the base of the next load: a pointer chase. */
+        __asm__ __volatile__(A "ld $8, 8(%1)\n\tld %0, 0($8)" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("chase", pass, r, v2);
+
+        /* In the branch right behind it. The output is written only at the
+         * end: GCC may give an "=r" output the same hard register as an
+         * input, and the compare needs %2 intact. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\t"
+                               "beq $8, %2, 1f\n\t"
+                               "daddu $9, $zero, $zero\n\t"
+                               "daddiu $9, $zero, 7\n\t"
+                               "1: daddiu %0, $9, 1" Z
+                             : "=r"(r) : "r"(q), "r"(OPAQUE((u64)v0)) : "$8", "$9");
+        CHECK_EQ_AT("branch", pass, r, 1u);
+
+        /* Stored at once, and the store reloaded at once. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tsd $8, 32(%1)\n\tld %0, 32(%1)" Z
+                             : "=r"(r) : "r"(q) : "$8", "memory");
+        CHECK_EQ_AT("store reload", pass, r, v0);
+
+        /* A second load into the same register wins. */
+        __asm__ __volatile__(A "ld $8, 0(%1)\n\tld $8, 16(%1)\n\tdaddu %0, $8, $zero" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("reload", pass, r, v2);
+
+        /* Narrow loads extend before the next instruction sees them. */
+        __asm__ __volatile__(A "lb $8, 40(%1)\n\tdaddu %0, $8, $zero" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("lb", pass, r, 0xFFFFFFFFFFFFFF80ull);
+        __asm__ __volatile__(A "lhu $8, 42(%1)\n\tdaddu %0, $8, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("lhu", pass, r, 0x7F01u + 0x7F01u);
+        __asm__ __volatile__(A "lw $8, 4(%1)\n\tdsubu %0, $zero, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("lw", pass, r, 0x0000000076543211ull);
+
+        /* The load in a delay slot, used at the branch target. */
+        __asm__ __volatile__(A "beq $zero, $zero, 1f\n\t"
+                               "ld $8, 0(%1)\n\t"
+                               "daddu $8, $zero, $zero\n\t"
+                               "1: daddu %0, $8, $8" Z
+                             : "=r"(r) : "r"(q) : "$8");
+        CHECK_EQ_AT("delay slot", pass, r, v0 + v0);
+    }
+}
+
+/*
+ * The instruction right behind a load raises an exception. A pipeline that
+ * lets a load move on to the memory stage without holding execute runs that
+ * instruction while the load is still in flight - in the first pass, still
+ * waiting for its D-cache fill - so the exception can be raised before the
+ * load has finished. The load comes first and must complete: the handler
+ * resumes with the loaded value in place, EPC names the trapping instruction,
+ * and there is exactly one exception.
+ *
+ * $9 holds the trapping instruction's address, taken before the load so that
+ * nothing sits between the load and the trap. Outputs are written only at
+ * the end (see the branch case above).
+ */
+#define LT_DLA9 ".set macro\n\tdla $9, 1f\n\t.set nomacro\n\t"
+
+static void t_load_then_trap(void)
+{
+    volatile u64 *q = (volatile u64 *)(_scratch_start + 512);
+    const u64 v0 = 0x0FEDCBA987654321ull;
+    u64 r, epc;
+    int pass;
+
+#define LT_ARM()                                                            \
+    do {                                                                    \
+        q[0] = v0;                                                          \
+        SYNC();                                                             \
+        dcache_wb_invalidate_range(q, 8);                                   \
+        SYNC();                                                             \
+        if (pass == 1) { u64 warm = q[0]; (void)warm; }                     \
+        exc_clear();                                                        \
+    } while (0)
+
+#define LT_CHECK(label, code)                                               \
+    do {                                                                    \
+        CHECK_EQ_AT(label " count", pass, exc.count, 1u);                   \
+        CHECK_EQ_AT(label " cause", pass, CAUSE_EXC(exc.cause), (u32)(code)); \
+        CHECK_EQ_AT(label " epc", pass, exc.epc, epc);                      \
+        CHECK_EQ_AT(label " value", pass, r, v0);                           \
+    } while (0)
+
+    for (pass = 0; pass < 2; pass++) {
+        LT_ARM();
+        __asm__ __volatile__(A LT_DLA9 "ld $8, 0(%2)\n\t1: syscall\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(epc) : "r"(q) : "$8", "$9");
+        LT_CHECK("syscall", EXC_SYS);
+
+        LT_ARM();
+        __asm__ __volatile__(A LT_DLA9 "ld $8, 0(%2)\n\t1: break\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(epc) : "r"(q) : "$8", "$9");
+        LT_CHECK("break", EXC_BP);
+
+        LT_ARM();
+        __asm__ __volatile__(A LT_DLA9 "ld $8, 0(%2)\n\t1: teq $zero, $zero\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(epc) : "r"(q) : "$8", "$9");
+        LT_CHECK("teq", EXC_TR);
+
+        /* Operands built in the block - see load_then_more's divide. */
+        LT_ARM();
+        __asm__ __volatile__(A "lui $11, 0x7FFF\n\tori $11, $11, 0xFFFF\n\tdaddiu $12, $zero, 1\n\t"
+                               LT_DLA9 "ld $8, 0(%2)\n\t1: add $10, $11, $12\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(epc) : "r"(q)
+                             : "$8", "$9", "$10", "$11", "$12");
+        LT_CHECK("add overflow", EXC_OV);
+
+        LT_ARM();
+        __asm__ __volatile__(A LT_DLA9 "ld $8, 0(%2)\n\t1: .word 0x70000000\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(epc) : "r"(q) : "$8", "$9");
+        LT_CHECK("reserved", EXC_RI);
+    }
+
+#undef LT_CHECK
+#undef LT_ARM
+}
+
+/*
+ * More of what can sit right behind a load: instructions that hold execute
+ * themselves (a CP0 read, a divide), a jump, and loads and stores close
+ * behind it - each after a load that did not have to hold execute. The
+ * store-then-load pair in the last case is the D-cache's READWAIT.
+ */
+static void t_load_then_more(void)
+{
+    volatile u64 *q = (volatile u64 *)(_scratch_start + 1024);
+    const u64 v0 = 0x0123456789ABCDEFull;
+    const u64 v4 = 0x5555AAAA3333CCCCull;
+    const u64 v8 = 0xF0E1D2C3B4A59687ull;
+    u64 r, s;
+    u32 st = cp0_status();
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        q[0] = v0; q[1] = 0; q[4] = v4; q[8] = v8; q[9] = 0;
+        SYNC();
+        dcache_wb_invalidate_range(q, 10 * 8);      /* three D-cache lines */
+        SYNC();
+        if (pass == 1) {
+            u64 warm = q[0] ^ q[1] ^ q[4] ^ q[8] ^ q[9];
+            (void)warm;
+        }
+
+        /* A CP0 read, which holds execute on its own. */
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tmfc0 $9, $12\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("mfc0 value", pass, r, v0);
+        CHECK_EQ_AT("mfc0 status", pass, s, (u64)(s64)(s32)st);
+
+        /* A divide, which holds execute for dozens of clocks. The operands
+         * are built in the block: a loop-invariant input can share a hard
+         * register with an "=r" output and arrive clobbered on pass 1. */
+        __asm__ __volatile__(A "lui $10, 0x3B9A\n\tori $10, $10, 0xCA07\n\t"   /* 1000000007 */
+                               "daddiu $11, $zero, 97\n\t"
+                               "ld $8, 0(%2)\n\tddivu $10, $11\n\tmflo $9\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q)
+                             : "$8", "$9", "$10", "$11");
+        CHECK_EQ_AT("ddivu value", pass, r, v0);
+        CHECK_EQ_AT("ddivu quotient", pass, s, 1000000007ull / 97ull);
+
+        /* A jump and its delay slot, fetched while the load is in flight. */
+        __asm__ __volatile__(A LT_DLA9 "ld $8, 0(%2)\n\tjr $9\n\tdaddiu $10, $zero, 5\n\t"
+                               "daddiu $10, $zero, 9\n\t"
+                               "1: daddu %0, $8, $zero\n\tdaddu %1, $10, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9", "$10");
+        CHECK_EQ_AT("jr value", pass, r, v0);
+        CHECK_EQ_AT("jr delay slot", pass, s, 5u);
+
+        /* A second load two instructions behind, from another line. */
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tdaddu $10, $zero, $zero\n\tld $9, 32(%2)\n\t"
+                               "daddu %0, $8, $10\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9", "$10");
+        CHECK_EQ_AT("load load first", pass, r, v0);
+        CHECK_EQ_AT("load load second", pass, s, v4);
+
+        /* A store two instructions behind, read straight back. */
+        __asm__ __volatile__(A "ld $8, 64(%2)\n\tdaddu $10, $zero, $zero\n\tsd $8, 72(%2)\n\t"
+                               "ld $9, 72(%2)\n\tdaddu %0, $8, $10\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9", "$10", "memory");
+        CHECK_EQ_AT("load store value", pass, r, v8);
+        CHECK_EQ_AT("load store reload", pass, s, v8);
+
+        /* A store, then a load right behind it that does not hold execute. */
+        __asm__ __volatile__(A "sd %3, 8(%2)\n\tld $8, 8(%2)\n\tdaddu $9, $zero, $zero\n\t"
+                               "daddu %0, $8, $9\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q), "r"(OPAQUE((u64)v4))
+                             : "$8", "$9", "memory");
+        CHECK_EQ_AT("store load value", pass, r, v4);
+        CHECK_EQ_AT("store load next", pass, s, 0u);
+    }
+}
+
 static const struct test tests[] = {
     TEST("mem/load_widths_sign",      t_load_widths_and_sign,            CPU_ALL),
     TEST("mem/store_widths",          t_store_widths,                    CPU_ALL),
@@ -435,6 +706,9 @@ static const struct test tests[] = {
     TEST("mem/unaligned_lh_faults",   t_unaligned_lh_faults,             CPU_ALL),
     TEST("mem/unaligned_family_ok",   t_unaligned_family_never_faults,   CPU_ALL),
     TEST("mem/kseg0_kseg1_alias",     t_kseg0_kseg1_alias,               CPU_ALL),
+    TEST("mem/load_then_use",         t_load_then_use,                   CPU_ALL),
+    TEST("mem/load_then_trap",        t_load_then_trap,                  CPU_ALL),
+    TEST("mem/load_then_more",        t_load_then_more,                  CPU_ALL),
 };
 
 const struct test_group group_mem = {
