@@ -177,8 +177,6 @@ EOF
 # security-scoped bookmark code in macos_sandbox.rs — was NOT compiled in. The
 # result was a bundle that could not reach a disk image outside its container
 # on the next launch, for a variant that was never meant to be sandboxed at all.
-# (It also masked a missing camera entitlement in the notarized file, since the
-# App Store one has it; the notarized file now carries device.camera too.)
 # Use `./scripts/build-macos.sh appstore` when you actually want the sandbox.
 # CODESIGN_IDENTITY overrides the default ad-hoc identity (e.g. a Developer ID
 # for persistent bookmarks).
