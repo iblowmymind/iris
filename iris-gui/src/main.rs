@@ -15,8 +15,6 @@ mod input;
 #[cfg(target_os = "macos")]
 mod macos_menu;
 mod macos_sandbox;
-#[cfg(target_os = "macos")]
-mod macos_screen;
 mod menus;
 mod netfix;
 mod netplan;
@@ -82,76 +80,54 @@ fn abs_path(p: &str) -> String {
         .unwrap_or_else(|_| p.to_string())
 }
 
-/// Device pixels per emulated pixel to draw a `fb_px` framebuffer into `avail`
-/// points at `ppp` device pixels per point, plus whether that scale is
-/// pixel-exact (so NEAREST sampling is safe).
+/// How far (in device pixels per emulated pixel) the fit may exceed a whole
+/// device-pixel scale and still be drawn at exactly that scale. Makes an
+/// integer scale "sticky" when the window is a little larger than it needs to
+/// be (window-manager rounding, a free resize that lands near 1×): the picture
+/// is drawn pixel-exact with a thin border instead of stretched by a fraction
+/// of a percent — which NEAREST can only do by dropping whole rows.
+const FB_INTEGER_SNAP: f32 = 0.02;
+
+/// Size (egui points) to draw a framebuffer of `px` native pixels in `avail`
+/// points at `ppp` device pixels per point, and whether that size is a whole
+/// number of device pixels per emulated pixel (so NEAREST is pixel-exact).
 ///
-/// At 1:1 and above the scale is floored to a whole number of device pixels —
-/// integer scaling, the only ratio at which every emulated pixel comes out the
-/// same size. A fractional scale has to double some source pixels and not
-/// others, which is exactly where rows and columns visibly go missing. Below
-/// 1:1 the framebuffer is larger than the space we have and there is no crisp
-/// answer, so we take the exact fit and let bilinear filtering smooth it.
-fn fb_device_scale(avail: egui::Vec2, fb_px: egui::Vec2, ppp: f32) -> (f32, bool) {
-    if fb_px.x < 1.0 || fb_px.y < 1.0 {
-        return (1.0, true);
+/// `max_scale` (points per emulated pixel) is the View > VM screen setting and
+/// caps the picture: a window with room for more (fullscreen, maximised, a
+/// manual resize) centres the display at the chosen scale instead of blowing
+/// it up to a fractional, filtered one. Only a window too small for it shrinks
+/// the picture to fit.
+///
+/// Only ever snaps *down* to the integer scale, never up: overhanging the
+/// panel would clip rows off the picture, which is the bug this exists to fix.
+/// Off an integer, returns the aspect-preserving fit to be drawn with LINEAR.
+fn fb_draw_size(avail: egui::Vec2, px: egui::Vec2, ppp: f32, max_scale: f32) -> (egui::Vec2, bool) {
+    let mut fit = fb_fit_size(avail, px);
+    if px.x < 1.0 || px.y < 1.0 || ppp <= 0.0 { return (fit, true); }
+    if max_scale > 0.0 && fit.y > px.y * max_scale {
+        fit = px * max_scale;
     }
-    let fit = (avail.x * ppp / fb_px.x).min(avail.y * ppp / fb_px.y);
-    if !fit.is_finite() || fit <= 0.0 {
-        return (1.0, true);
-    }
-    if fit < 1.0 {
-        return (fit, false);
-    }
-    let n = fit.floor();
-    // The window is sized to hold an exact integer scale, so the fit normally
-    // lands *on* an integer — but the window manager rounds the frame to whole
-    // device pixels and can leave us a hair short, which would knock 2x down to
-    // 1x and halve the picture. Take the next step up when it overhangs by no
-    // more than a single device pixel (invisible, and clipped by the panel).
-    let up = n + 1.0;
-    if up * fb_px.x - avail.x * ppp <= 1.0 && up * fb_px.y - avail.y * ppp <= 1.0 {
-        (up, true)
+    let dev = fit.y * ppp / px.y;
+    // The epsilon absorbs float error when the fit is exactly an integer.
+    let n = (dev + 1e-3).floor();
+    if n >= 1.0 && dev - n <= FB_INTEGER_SNAP {
+        (px * (n / ppp), true)
     } else {
-        (n, true)
+        (fit, false)
     }
 }
 
-/// Compute the draw size and sampler together so resizing cannot leave a
-/// stale nearest sampler on a fractionally stretched image.
-fn display_size(avail: egui::Vec2, px: egui::Vec2, ppp: f32,
-                mode: settings::DisplayScaling, keep_aspect: bool) -> (egui::Vec2, bool) {
-    match mode {
-        settings::DisplayScaling::NearestInteger => {
-            let (scale, nearest) = fb_device_scale(avail, px, ppp);
-            (px * (scale / ppp), nearest)
-        }
-        settings::DisplayScaling::Stretch => {
-            (if keep_aspect { fb_fit_size(avail, px) } else { avail }, false)
-        }
-    }
-}
-
-/// Snap `rect` to the device-pixel grid. An image whose edges sit on a fraction
-/// of a device pixel is sampled across pixel boundaries, so even at an exact
-/// integer scale NEAREST drops or doubles whole rows and columns.
-fn snap_rect_to_pixels(rect: egui::Rect, ppp: f32) -> egui::Rect {
+/// Centre the framebuffer in `outer` and put its edges on the device-pixel
+/// grid. `centered_and_justified` leaves the origin on a fractional device
+/// pixel whenever the leftover space is odd, and NEAREST then samples across
+/// texel boundaries and drops or doubles rows even at an exact integer scale.
+fn fb_draw_rect(outer: egui::Rect, px: egui::Vec2, ppp: f32, max_scale: f32) -> (egui::Rect, bool) {
+    let (size, nearest) = fb_draw_size(outer.size(), px, ppp, max_scale);
+    let rect = egui::Rect::from_center_size(outer.center(), size);
+    if ppp <= 0.0 { return (rect, nearest); }
     let snap = |v: f32| (v * ppp).round() / ppp;
-    egui::Rect::from_min_size(
-        egui::pos2(snap(rect.min.x), snap(rect.min.y)),
-        egui::vec2(snap(rect.width()), snap(rect.height())),
-    )
-}
-
-/// Device pixels per emulated pixel for a requested View-menu scale. `vm_scale`
-/// is in *logical points* per emulated pixel (1x = native), so what it asks of
-/// the display backing depends on HiDPI: 1x is 1 device pixel on a standard
-/// screen and 2 on a Retina one. Floored to a whole number of device pixels at
-/// 1:1 and above, so the size the window is fitted to is one we can draw
-/// pixel-exactly.
-fn requested_device_scale(vm_scale: f32, native_ppp: f32) -> f32 {
-    let s = vm_scale * native_ppp;
-    if s >= 1.0 { s.floor() } else { s.max(0.05) }
+    let min = egui::pos2(snap(rect.min.x), snap(rect.min.y));
+    (egui::Rect::from_min_size(min, egui::vec2(snap(size.x), snap(size.y))), nearest)
 }
 
 fn main() -> eframe::Result<()> {
@@ -1416,70 +1392,69 @@ impl App {
     /// monitor). Does NOT write the clamped value back to `prefs.vm_scale` — the
     /// slider stays the user's requested scale so it can always be dragged; the
     /// footer readout reports the scale actually achieved.
-    fn snap_window_to_fb(ctx: &egui::Context, fb_px: egui::Vec2, central_avail: egui::Vec2, vm_scale: f32) {
-        if fb_px.x < 1.0 || fb_px.y < 1.0 { return; }
+    /// Returns false when the resize was deferred (fullscreen), so the caller
+    /// can keep the request pending until the window can take it.
+    fn snap_window_to_fb(ctx: &egui::Context, fb_px: egui::Vec2, central_avail: egui::Vec2, vm_scale: f32) -> bool {
+        if fb_px.x < 1.0 || fb_px.y < 1.0 { return true; }
+        // A fullscreen window can't change size: InnerSize would only shrink
+        // the rendered area inside the fullscreen space, leaving the UI in a
+        // corner surrounded by black. The draw already centres the picture at
+        // the chosen scale (`fb_draw_size` caps at `vm_scale`), so there is
+        // nothing to resize now; the window is fitted once fullscreen ends.
+        if ctx.input(|i| i.viewport().fullscreen).unwrap_or(false) { return false; }
         // egui-winit reports viewport_rect / available_size / monitor_size and interprets ViewportCommand::InnerSize in the same (zoom-scaled) point space, so chrome math stays in egui points.
         let screen = ctx.viewport_rect().size();
         let chrome_w = (screen.x - central_avail.x).max(0.0);
         let chrome_h = (screen.y - central_avail.y).max(0.0);
         let zoom = ctx.zoom_factor().max(0.1);
-        let ppp = ctx.pixels_per_point().max(0.1);
-        let native_ppp = (ppp / zoom).max(0.1);
-        // Device pixels per emulated pixel the user asked for, floored to a
-        // whole number at 1:1 and above so the window is fitted to a picture we
-        // can draw pixel-exactly (see `fb_device_scale`).
-        let want_dev = requested_device_scale(vm_scale, native_ppp);
-        // Keep clear of the desktop's own furniture -- the window's own title
-        // bar, plus the macOS menu bar / a taskbar -- so the window isn't
-        // pushed underneath it. And no more than that: the blanket 15% margin
-        // this replaces silently turned a requested 1x into ~0.9x on a 1080p
-        // screen (0.85 * 1080 = 918 points for a display that needs 1024),
-        // which is why the picture was never crisp at 1x. Room for a 1280x1024
-        // display at 1x on a 1080p screen comes down to a handful of points, so
-        // the title bar is *measured* rather than guessed; only the menu bar is
-        // an allowance. Sizes here are all in zoom-scaled egui points, so a
-        // reserve expressed in native points is divided by the zoom.
-        const MENU_BAR: f32 = 26.0;
+        // Target points-per-pixel for the requested VM scale (vm_scale device
+        // pixels per emulated pixel at native backing). Dividing by zoom keeps
+        // the picture decoupled from the UI scale, so scaling the controls
+        // widens the window instead of shrinking the display.
+        let target = (vm_scale / zoom).max(0.01);
+        // Shrink only if the request really doesn't fit the monitor. This used
+        // to cap the window at 85% of the monitor, which silently turned 1× into
+        // ~0.9× on any screen where 1024 rows plus chrome fit but not in 85% of
+        // it. Reserve only the window's own title bar (measured when the
+        // platform reports it). Do NOT guess at a menu bar / taskbar / Dock
+        // allowance: 1280x1024 at 1x on a 1080p screen has ~3 points to spare
+        // (1080 - 25 menu bar - 28 title bar = 1027), so any fixed reserve that
+        // covers the worst case knocks the common case off 1x and into a
+        // filtered 0.99x. If the request exceeds the real usable area, the
+        // window manager shrinks the window itself and the draw falls back to a
+        // filtered fit rather than clipping rows. Fall back to a conservative
+        // cap if the monitor size isn't reported, so a high VM scale can never
+        // blow the window up off-screen and push the controls out of view.
         let decoration = ctx.input(|i| {
             let vp = i.viewport();
             match (vp.outer_rect, vp.inner_rect) {
-                (Some(o), Some(inner)) => (o.height() - inner.height()).max(0.0),
-                _ => 28.0,
+                (Some(o), Some(inner)) if o.height() > inner.height() => o.height() - inner.height(),
+                _ => 28.0 / zoom,
             }
         });
-        // macOS will tell us the real usable area (and constrains the window to
-        // it anyway, so a size derived from anything larger is a size we will
-        // not get). Elsewhere, estimate it from the monitor.
-        #[cfg(target_os = "macos")]
-        let work_area = macos_screen::work_area().map(|(w, h)| egui::vec2(w / zoom, h / zoom));
-        #[cfg(not(target_os = "macos"))]
-        let work_area: Option<egui::Vec2> = None;
-        let (avail_w, avail_h) = match (work_area, ctx.input(|i| i.viewport().monitor_size)) {
-            (Some(a), _) => (a.x - chrome_w, a.y - decoration - chrome_h),
-            (None, Some(m)) => (
-                m.x - 16.0 / zoom - chrome_w,
-                m.y - decoration - MENU_BAR / zoom - chrome_h,
-            ),
-            // Nothing known: a conservative cap, so a high VM scale can never
-            // blow the window up off-screen.
-            (None, None) => (1400.0 - chrome_w, 900.0 - chrome_h),
+        let (avail_w, avail_h) = match ctx.input(|i| i.viewport().monitor_size) {
+            Some(m) => (m.x - chrome_w, m.y - decoration - chrome_h),
+            None => (1400.0 - chrome_w, 900.0 - chrome_h),
         };
-        // Honour the request when it fits. When it doesn't, take the exact fit
-        // rather than stepping down to the next whole device scale: below the
-        // requested size we are minifying, where nothing is pixel-exact anyway,
-        // and a step down is a *halving* on a HiDPI screen -- much worse than a
-        // slightly smoothed picture a few percent under the size asked for.
-        let fit_dev = ((avail_w.max(64.0) / fb_px.x) * ppp).min((avail_h.max(64.0) / fb_px.y) * ppp);
-        let dev = if fit_dev >= want_dev { want_dev } else { fit_dev.max(0.05) };
-        let scale = dev / ppp;
+        // Use the requested scale, or the largest that fits when the monitor is
+        // the binding constraint. The slider already restricts requests to clean
+        // ¼× steps, so we don't snap here — when we must clamp to the monitor we
+        // use the full fitting size (the footer readout reports the actual scale
+        // and tags non-crisp ones) rather than dropping a whole step.
+        // Largest scale that fits, never exceeding the requested target, floored
+        // at a sane minimum — but the floor must not exceed target, or clamp()
+        // panics (min > max) on a degenerate target from a zeroed/garbage scale.
+        let scale = target
+            .min((avail_w.max(64.0)) / fb_px.x)
+            .min((avail_h.max(64.0)) / fb_px.y)
+            .clamp(0.05_f32.min(target), target);
         // A point of slack per axis: the window manager rounds the frame to
-        // whole device pixels, and coming up a hair short would otherwise cost
-        // a whole integer step when the picture is drawn.
-        let inner = egui::vec2(
-            fb_px.x * scale + chrome_w + 1.0,
-            fb_px.y * scale + chrome_h + 1.0,
-        );
+        // whole device pixels, and coming up a hair short of the requested
+        // scale would push the draw off the integer (see `fb_draw_size`, which
+        // absorbs the slack by snapping back down).
+        let inner = egui::vec2(fb_px.x * scale + chrome_w + 1.0, fb_px.y * scale + chrome_h + 1.0);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(inner));
+        true
     }
 
     /// Draw the live REX3 framebuffer as an egui image, scaled to fit
@@ -1492,52 +1467,73 @@ impl App {
         self.framebuffer_panel_single(ui);
     }
 
-    /// Dual Newport heads share the scaling policy and capture input.
+    /// Dual Newport heads: side-by-side viewports (head 0 captures input).
     fn framebuffer_panel_dual(&mut self, ui: &mut egui::Ui) {
-        let mode = self.prefs.display_scaling;
-        let keep_aspect = self.prefs.keep_aspect_ratio;
-        let outer = ui.available_rect_before_wrap();
-        let ppp = ui.ctx().pixels_per_point();
-        if self.pending_fb_snap {
-            if let Some(tex) = &self.fb_tex {
-                Self::snap_window_to_fb(ui.ctx(), tex.size_vec2() * egui::vec2(2.0, 1.0),
-                    outer.size(), self.prefs.vm_scale);
-                self.pending_fb_snap = false;
-            }
+        let max_scale = self.fb_max_scale(ui.ctx());
+        let seq0 = self.emu.frame_sink.seq();
+        let seq1 = self.emu.frame_sink_head1.seq();
+        if seq0 == 0 && seq1 == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Emulator running — waiting for first REX3 frame…")
+                    .color(Color32::LIGHT_GRAY));
+            });
+            return;
         }
-        let mut clicked = false;
-        for head in 0..2 {
-            let left = outer.left() + outer.width() * head as f32 / 2.0;
-            let area = egui::Rect::from_min_size(
-                egui::pos2(left, outer.top()), egui::vec2(outer.width() / 2.0, outer.height()));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
-                let (sink, tex, seq, id) = if head == 0 {
-                    (&self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb")
+        ui.columns(2, |cols| {
+            cols[0].vertical(|ui| {
+                ui.label(RichText::new("Head 0").small().weak());
+                if seq0 > 0 {
+                    Self::upload_fb_texture(ui, &self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb", max_scale);
+                    if let Some(tex) = &self.fb_tex {
+                        let (response, _) = Self::paint_fb(ui, tex, max_scale);
+                        if response.clicked() {
+                            response.request_focus();
+                            self.input_state.captured = true;
+                        }
+                    }
                 } else {
-                    (&self.emu.frame_sink_head1, &mut self.fb_tex_head1, &mut self.last_fb_seq_head1, "rex3_fb_h1")
-                };
-                Self::upload_fb_texture(ui, sink, tex, seq, id, mode, keep_aspect);
-                if let Some(tex) = tex {
-                    let (size, nearest) = display_size(area.size(), tex.size_vec2(), ppp, mode, keep_aspect);
-                    let rect = snap_rect_to_pixels(egui::Rect::from_center_size(area.center(), size), ppp);
-                    ui.painter().image(tex.id(), rect,
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    let response = ui.interact(rect, ui.id().with(id), egui::Sense::click());
-                    if response.clicked() { response.request_focus(); clicked = true; }
-                    if head == 0 && self.input_state.captured {
-                        response.request_focus();
-                        ui.memory_mut(|m| m.set_focus_lock_filter(response.id, egui::EventFilter {
-                            tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true,
-                        }));
-                    }
-                    if head == 0 {
-                        self.fb_nearest = nearest;
-                        self.fb_scale = size.y * ui.ctx().zoom_factor() / tex.size_vec2().y;
-                    }
+                    ui.label(RichText::new("waiting…").weak());
                 }
             });
-        }
-        self.framebuffer_input(ui, clicked);
+            cols[1].vertical(|ui| {
+                ui.label(RichText::new("Head 1").small().weak());
+                if seq1 > 0 {
+                    Self::upload_fb_texture(
+                        ui,
+                        &self.emu.frame_sink_head1,
+                        &mut self.fb_tex_head1,
+                        &mut self.last_fb_seq_head1,
+                        "rex3_fb_h1",
+                        max_scale,
+                    );
+                    if let Some(tex) = &self.fb_tex_head1 {
+                        Self::paint_fb(ui, tex, max_scale);
+                    }
+                } else {
+                    ui.label(RichText::new("waiting…").weak());
+                }
+            });
+        });
+    }
+
+    /// Paint a framebuffer texture centred in the remaining space, on the
+    /// device-pixel grid (see `fb_draw_rect`). Painted directly rather than via
+    /// `egui::Image` + layout so nothing re-rounds the rect off the grid.
+    /// Returns the click response and the exact rect drawn.
+    fn paint_fb(ui: &mut egui::Ui, tex: &egui::TextureHandle, max_scale: f32) -> (egui::Response, egui::Rect) {
+        let ppp = ui.ctx().pixels_per_point();
+        let (rect, _) = fb_draw_rect(ui.available_rect_before_wrap(), tex.size_vec2(), ppp, max_scale);
+        let response = ui.allocate_rect(rect, egui::Sense::click());
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), rect, uv, Color32::WHITE);
+        (response, rect)
+    }
+
+    /// The View > VM screen scale in zoom-scaled points per emulated pixel —
+    /// the most the picture is ever drawn at (see `fb_draw_size`). Same units
+    /// as the window-fit target in `snap_window_to_fb`.
+    fn fb_max_scale(&self, ctx: &egui::Context) -> f32 {
+        self.prefs.vm_scale / ctx.zoom_factor().max(0.1)
     }
 
     fn upload_fb_texture(
@@ -1546,21 +1542,22 @@ impl App {
         tex_slot: &mut Option<egui::TextureHandle>,
         last_seq: &mut u64,
         tex_id: &str,
-        mode: settings::DisplayScaling,
-        keep_aspect: bool,
+        max_scale: f32,
     ) {
         let seq = sink.seq();
         if seq == 0 { return; }
-        let want_nearest = tex_slot.as_ref().map(|tex| {
-            display_size(ui.available_size(), tex.size_vec2(), ui.ctx().pixels_per_point(), mode, keep_aspect).1
-        }).unwrap_or(mode == settings::DisplayScaling::NearestInteger);
-        let opts = if want_nearest { egui::TextureOptions::NEAREST } else { egui::TextureOptions::LINEAR };
-        if tex_slot.is_none() || seq != *last_seq || tex_slot.as_ref().is_some_and(|t| ui.ctx().tex_manager().read().meta(t.id()).is_some_and(|m| m.options != opts)) {
+        let want_nearest = match tex_slot.as_ref().map(|t| t.size_vec2()) {
+            Some(px) => fb_draw_size(ui.available_size(), px, ui.ctx().pixels_per_point(), max_scale).1,
+            None => true,
+        };
+        if tex_slot.is_none() || seq != *last_seq {
             let frame = sink.snapshot();
             if frame.width == 0 || frame.height == 0 { return; }
-            let (_, nearest) = display_size(ui.available_size(),
-                egui::vec2(frame.width as f32, frame.height as f32), ui.ctx().pixels_per_point(), mode, keep_aspect);
-            let opts = if nearest { egui::TextureOptions::NEAREST } else { egui::TextureOptions::LINEAR };
+            let opts = if want_nearest {
+                egui::TextureOptions::NEAREST
+            } else {
+                egui::TextureOptions::LINEAR
+            };
             let img = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width, frame.height],
                 &frame.rgba,
@@ -1588,30 +1585,30 @@ impl App {
         }
 
         let avail = ui.available_size();
+        let max_scale = self.fb_max_scale(ui.ctx());
 
-        // Pick the texture filter from the *device-pixel* scale the framebuffer
-        // will actually be drawn at. `fb_device_scale` gives us a whole number
-        // of device pixels per emulated pixel whenever the picture is at 1:1 or
-        // larger, and NEAREST then keeps every emulated pixel crisp and square.
-        // Only a genuine minification (the window is smaller than the
-        // framebuffer) is fractional, and there LINEAR spreads the error rather
-        // than dropping whole rows. We need the native size to compute this, so
-        // on the very first frame (no texture yet) we default to NEAREST and
-        // correct on the next frame.
+        // Pick the texture filter from the *device-pixel* scale at which the
+        // framebuffer will actually be drawn. At an integer scale (native 1×,
+        // 2×, 3×, …) NEAREST keeps every emulated pixel crisp and square. At a
+        // fractional scale — which is what most users hit once they set a
+        // non-100% UI scale or resize the window freely — NEAREST has to double
+        // some source pixels and not others, so e.g. the strokes of a "T" come
+        // out uneven; LINEAR (bilinear) spreads the error and looks right. We
+        // need the native size to compute this, so on the very first frame
+        // (no texture yet) we default to NEAREST and correct on the next frame.
+        // A fit just above an integer is drawn *at* that integer (see
+        // `fb_draw_size`) — never NEAREST at a size a hair off it, which is
+        // what used to drop a few rows near 1×.
         let zoom = ui.ctx().zoom_factor();
-        let ppp = ui.ctx().pixels_per_point();
         let want_nearest = match self.fb_tex.as_ref().map(|t| t.size_vec2()) {
-            Some(px) if px.x >= 1.0 && px.y >= 1.0 => display_size(avail, px, ppp, self.prefs.display_scaling, self.prefs.keep_aspect_ratio).1,
-            _ => self.prefs.display_scaling == settings::DisplayScaling::NearestInteger,
+            Some(px) => fb_draw_size(avail, px, ui.ctx().pixels_per_point(), max_scale).1,
+            None => true,
         };
 
         if self.fb_tex.is_none() || seq != self.last_fb_seq || want_nearest != self.fb_nearest {
             let frame = self.emu.frame_sink.snapshot();
             if frame.width == 0 || frame.height == 0 { return; }
 
-            let (_, want_nearest) = display_size(avail,
-                egui::vec2(frame.width as f32, frame.height as f32), ppp,
-                self.prefs.display_scaling, self.prefs.keep_aspect_ratio);
             let opts = if want_nearest {
                 egui::TextureOptions::NEAREST
             } else {
@@ -1620,7 +1617,7 @@ impl App {
 
             let partial = frame.dirty_h > 0
                 && frame.dirty_h < frame.height as u32
-                && self.fb_tex.as_ref().is_some_and(|t| t.size() == [frame.width, frame.height]);
+                && self.fb_tex.is_some();
 
             if partial {
                 let y = frame.dirty_y as usize;
@@ -1662,34 +1659,22 @@ impl App {
             let tex_size = tex.size_vec2();
             // First frame after Start (or after a VM/UI scale change): size the
             // window so the picture lands at the requested VM scale.
-            if do_snap {
-                Self::snap_window_to_fb(ui.ctx(), tex_size, avail, self.prefs.vm_scale);
+            if do_snap && !Self::snap_window_to_fb(ui.ctx(), tex_size, avail, self.prefs.vm_scale) {
+                self.pending_fb_snap = true;
             }
-            // Both modes share the centered, device-pixel-aligned draw path.
-            let (size, _) = display_size(avail, tex_size, ppp,
-                self.prefs.display_scaling, self.prefs.keep_aspect_ratio);
-            // Reported VM scale: logical points per emulated pixel relative to
-            // native backing (1.0 = native). `size` is in zoom-scaled points, so
-            // multiply by zoom to recover the zoom-independent figure.
+            // Draw at the chosen VM scale, centred; shrink to fit (aspect-
+            // preserved) only when the window is too small for it. The snap
+            // above sizes the window to the scale, so the steady-state draw is
+            // stable: no per-frame resize, no jitter.
+            let (response, fb_rect) = Self::paint_fb(ui, tex, max_scale);
+            // Reported VM scale: device pixels per emulated pixel relative to
+            // native backing (1.0 = native). The rect is in zoom-scaled points,
+            // so multiply by zoom to recover the zoom-independent figure.
             if tex_size.y >= 1.0 {
-                new_fb_scale = size.y * zoom / tex_size.y;
+                new_fb_scale = fb_rect.height() * zoom / tex_size.y;
             }
-            let outer = ui.available_rect_before_wrap();
-            let rect = snap_rect_to_pixels(
-                egui::Rect::from_center_size(outer.center(), size),
-                ppp,
-            );
             let captured = self.input_state.captured;
             {
-                // A fixed id (rather than the layout's running auto-id) so
-                // keyboard focus survives across frames while captured.
-                let response = ui.interact(rect, ui.id().with("rex3_fb"), egui::Sense::click());
-                ui.painter().image(
-                    tex.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
                 // Take keyboard focus so that egui delivers Key events
                 // to us instead of routing them to other widgets when
                 // the user clicks into the FB.
@@ -1724,10 +1709,10 @@ impl App {
             // latter also trips on 0-MIPS idle at the PROM, which would wrongly
             // dim a machine that's only paused. The frame underneath stays visible.
             if self.emu.status.cpu_stopped {
-                let p = ui.painter_at(rect);
-                p.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(40, 42, 48, 130));
+                let p = ui.painter_at(fb_rect);
+                p.rect_filled(fb_rect, 0.0, Color32::from_rgba_unmultiplied(40, 42, 48, 130));
                 p.text(
-                    rect.center(),
+                    fb_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "Powered off",
                     egui::FontId::proportional(26.0),
@@ -1736,10 +1721,7 @@ impl App {
             }
         }
         self.fb_scale = new_fb_scale;
-        self.framebuffer_input(ui, fb_clicked);
-    }
 
-    fn framebuffer_input(&mut self, ui: &egui::Ui, fb_clicked: bool) {
         // When the guest becomes "safe to stop" (CPU halted — a clean IRIX
         // shutdown / `halt`), auto-release the captured mouse & keyboard so the
         // user gets their cursor back without pressing Ctrl+Alt+Esc. Edge-
@@ -2703,21 +2685,8 @@ impl eframe::App for App {
         // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
         // a little bigger. Keep the dark panel fill so the aspect-ratio
         // letterbox bars stay black.
-        //
-        // While a machine runs, paint the panel black rather than taking the
-        // theme's `panel_fill`. The space around the picture is the inside of a
-        // monitor bezel, not application chrome: the moment the window is wider
-        // than 5:4 — maximised, or fullscreen — the theme colour becomes two
-        // bright bars framing the guest's display in light mode (and merely a
-        // different grey in dark mode). Black is the only colour that reads as
-        // "there is nothing here".
         let central_frame = egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::ZERO);
-        let central_frame = if self.emu.is_running() {
-            central_frame.fill(Color32::BLACK)
-        } else {
-            central_frame
-        };
         egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             // While a machine is running the main window is the guest's display
             // and nothing else: the config editor, help and every confirmation
@@ -2742,7 +2711,7 @@ impl eframe::App for App {
                 if self.pending_launcher_fit
                     && ui.ctx().input(|i| i.viewport().monitor_size).is_some()
                 {
-                    Self::snap_window_to_fb(
+                    self.pending_launcher_fit = !Self::snap_window_to_fb(
                         ui.ctx(),
                         egui::vec2(
                             self.cfg.graphics.host_display_size().0 as f32,
@@ -2751,7 +2720,6 @@ impl eframe::App for App {
                         ui.available_size(),
                         self.prefs.vm_scale,
                     );
-                    self.pending_launcher_fit = false;
                 }
                 // Emulator not running: make sure a leftover mouse capture is
                 // released so the host cursor isn't stuck hidden/locked.
@@ -3171,18 +3139,6 @@ impl eframe::App for App {
         }
     }
 
-    /// What eframe clears the framebuffer to before any panel is drawn. Black
-    /// while a machine runs, for the same reason the central panel is: a resize
-    /// that outruns the next repaint would otherwise flash the theme colour
-    /// around the guest's display.
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        if self.emu.is_running() {
-            Color32::BLACK.to_normalized_gamma_f32()
-        } else {
-            visuals.panel_fill.to_normalized_gamma_f32()
-        }
-    }
-
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Make sure the latest cfg lands in `machines` before save().
         if self.cfg_dirty { self.flush_machine(); } else { let _ = self.prefs.save(); }
@@ -3264,49 +3220,66 @@ mod preflight_tests {
 }
 
 #[cfg(test)]
-mod display_scaling_tests {
+mod fb_scaling_tests {
     use super::*;
-    use settings::DisplayScaling::{NearestInteger, Stretch};
+
+    const FB: egui::Vec2 = egui::vec2(1280.0, 1024.0);
 
     #[test]
-    fn modes_fit_a_widescreen_window() {
-        let available = egui::vec2(1920.0, 1080.0);
-        let source = egui::vec2(1280.0, 1024.0);
-        assert_eq!(display_size(available, source, 1.0, NearestInteger, false), (source, true));
-        assert_eq!(display_size(available, source, 1.0, Stretch, false), (available, false));
-        assert_eq!(display_size(available, source, 1.0, Stretch, true), (egui::vec2(1350.0, 1080.0), false));
+    fn exact_fit_is_integer_and_nearest() {
+        assert_eq!(fb_draw_size(FB, FB, 1.0, 0.0), (FB, true));
+        assert_eq!(fb_draw_size(FB, FB, 2.0, 0.0), (FB, true)); // Retina 1× = 2 device px
+        assert_eq!(fb_draw_size(FB * 2.0, FB, 1.0, 0.0), (FB * 2.0, true));
     }
 
     #[test]
-    fn portrait_and_small_windows_preserve_aspect_when_requested() {
-        let source = egui::vec2(1280.0, 1024.0);
-        for available in [egui::vec2(800.0, 1200.0), egui::vec2(640.0, 400.0)] {
-            let (size, nearest) = display_size(available, source, 1.0, Stretch, true);
-            assert!(!nearest);
-            assert!(size.x <= available.x && size.y <= available.y);
-            assert!((size.x / size.y - 1.25).abs() < 0.0001);
+    fn slightly_large_window_snaps_down_never_up() {
+        // Window-manager slack / a free resize a few pixels past 1×.
+        let (size, nearest) = fb_draw_size(egui::vec2(1290.0, 1034.0), FB, 1.0, 0.0);
+        assert_eq!((size, nearest), (FB, true));
+        // A hair short of 1× must not be drawn at 1× (that clips rows); it is
+        // a filtered fit instead.
+        let (size, nearest) = fb_draw_size(egui::vec2(1280.0, 1020.0), FB, 1.0, 0.0);
+        assert!(!nearest);
+        assert!(size.y <= 1020.0);
+    }
+
+    #[test]
+    fn fractional_fit_is_filtered() {
+        let (size, nearest) = fb_draw_size(egui::vec2(1600.0, 1280.0), FB, 1.0, 0.0);
+        assert!(!nearest);
+        assert_eq!(size, egui::vec2(1600.0, 1280.0));
+    }
+
+    #[test]
+    fn rect_lands_on_device_pixel_grid() {
+        for ppp in [1.0_f32, 1.5, 2.0] {
+            // Odd leftover space puts the centred origin on a half pixel.
+            let outer = egui::Rect::from_min_size(egui::pos2(250.3, 0.0), egui::vec2(1283.0, 1027.0) / ppp);
+            let (rect, nearest) = fb_draw_rect(outer, FB, ppp, 0.0);
+            assert!(nearest);
+            for v in [rect.min.x, rect.min.y, rect.width(), rect.height()] {
+                assert!((v * ppp - (v * ppp).round()).abs() < 1e-3, "ppp {ppp}: {v} off grid");
+            }
+            assert!(outer.contains_rect(rect.shrink(0.5 / ppp)));
         }
     }
 
     #[test]
-    fn retina_integer_scaling_uses_device_pixels_and_aligned_edges() {
-        let source = egui::vec2(1280.0, 1024.0);
-        let (size, nearest) = display_size(egui::vec2(1920.0, 1080.0), source, 2.0, NearestInteger, true);
-        assert_eq!(size, source);
+    fn larger_window_is_capped_at_vm_scale_and_centred() {
+        // Fullscreen 1080p minus the 186pt control column, VM screen at 1x.
+        let outer = egui::Rect::from_min_size(egui::pos2(186.0, 0.0), egui::vec2(1734.0, 1080.0));
+        let (rect, nearest) = fb_draw_rect(outer, FB, 1.0, 1.0);
         assert!(nearest);
-        let rect = snap_rect_to_pixels(egui::Rect::from_center_size(egui::pos2(960.25, 540.25), size), 2.0);
-        assert_eq!(rect.min.x * 2.0, (rect.min.x * 2.0).round());
-        assert_eq!(rect.size() * 2.0, source * 2.0);
-    }
-
-    #[test]
-    fn old_preferences_keep_integer_mode_and_new_choices_round_trip() {
-        let mut prefs: GuiSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(prefs.display_scaling, NearestInteger);
-        prefs.display_scaling = Stretch;
-        prefs.keep_aspect_ratio = true;
-        let loaded: GuiSettings = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
-        assert_eq!(loaded.display_scaling, Stretch);
-        assert!(loaded.keep_aspect_ratio);
+        assert_eq!(rect.size(), FB);
+        assert_eq!(rect.center().round(), outer.center().round());
+        // Retina, 1x = 2 device px: still capped at 1280x1024 points.
+        assert_eq!(fb_draw_size(egui::vec2(3000.0, 2000.0), FB, 2.0, 1.0), (FB, true));
+        // 0.5x on Retina = 1 device px per emulated pixel: crisp.
+        assert_eq!(fb_draw_size(egui::vec2(3000.0, 2000.0), FB, 2.0, 0.5), (FB * 0.5, true));
+        // A window too small for the setting still shrinks to fit.
+        let (size, nearest) = fb_draw_size(egui::vec2(1000.0, 800.0), FB, 1.0, 1.0);
+        assert!(!nearest);
+        assert!(size.y <= 800.0);
     }
 }

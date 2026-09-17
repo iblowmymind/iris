@@ -113,8 +113,7 @@ drives. Each ID shows its current state inline:
 ### The window
 
 On macOS, once a machine is running the window holds **the emulator screen and nothing
-else** — the live REX3 framebuffer, drawn centered at a whole number of device
-pixels per emulated pixel wherever it fits (see *Scaling* below). While idle it
+else** — the live REX3 framebuffer, drawn aspect-fit and centered. While idle it
 shows the **welcome / status panel** instead: active machine name,
 PROM/NVRAM/RAM summary, attached drive list, network mode, and the big Start
 button.
@@ -138,23 +137,6 @@ panel beside the running display. Dialogs stay inside the main window.
 On macOS, **File → Configuration…** (⌘,) opens the tabbed editor in a separate
 window. On Windows and Linux, use **Edit config…** in the sidebar or select a
 configuration tab from **View**. The editor starts closed on each launch.
-
-### Scaling
-
-In **View → Graphics scaling**, choose one of two modes:
-
-- **Nearest integer** (default): centers the display at the largest whole
-  device-pixel scale that fits, with black space around it. If the window is
-  smaller than the framebuffer at 1×, it scales down with filtering.
-- **Stretch**: fills the window using linear filtering. Enable **Keep aspect
-  ratio** to fit the largest undistorted picture, with black space around it.
-
-Both options apply to windowed and fullscreen display and persist across launches.
-With two display heads, each head scales within its half of the window.
-
-**View → Emulator scale** on macOS, or **VM screen** in the sidebar View menu, resizes the window to a requested size in logical
-points per emulated pixel. This is separate from the graphics scaling mode.
-On Retina displays, one logical point typically spans two device pixels.
 
 The **Video-In** tab's source selector offers:
 

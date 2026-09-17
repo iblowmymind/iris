@@ -52,8 +52,6 @@ pub enum Action {
     // --- View ---
     ToggleFullscreen,
     SetVmScale(f32),
-    SetDisplayScaling(settings::DisplayScaling),
-    ToggleAspectRatio,
     SetUiScale(f32),
     ShowConfig,
 
@@ -480,21 +478,6 @@ impl App {
             Item::Separator,
         ];
 
-        use settings::DisplayScaling;
-        items.push(Item::Sub {
-            label: "Graphics scaling".into(),
-            items: vec![
-                act("Nearest integer", Action::SetDisplayScaling(DisplayScaling::NearestInteger))
-                    .checked_if(self.prefs.display_scaling == DisplayScaling::NearestInteger),
-                act("Stretch", Action::SetDisplayScaling(DisplayScaling::Stretch))
-                    .checked_if(self.prefs.display_scaling == DisplayScaling::Stretch),
-                Item::Separator,
-                act("Keep aspect ratio", Action::ToggleAspectRatio)
-                    .checked_if(self.prefs.keep_aspect_ratio)
-                    .enabled_if(self.prefs.display_scaling == DisplayScaling::Stretch),
-            ],
-        });
-
         // The emulated display is drawn at a whole number of device pixels per
         // emulated pixel wherever it can be, so these are exact: 1× is the
         // guest's own resolution, one emulated pixel per logical point.
@@ -721,16 +704,6 @@ impl App {
             // --- View ---
             Action::ToggleFullscreen => {
                 self.toggle_fullscreen(ctx);
-            }
-            Action::SetDisplayScaling(mode) => {
-                self.prefs.display_scaling = mode;
-                let _ = self.prefs.save();
-                ctx.request_repaint();
-            }
-            Action::ToggleAspectRatio => {
-                self.prefs.keep_aspect_ratio = !self.prefs.keep_aspect_ratio;
-                let _ = self.prefs.save();
-                ctx.request_repaint();
             }
             Action::SetVmScale(s) => {
                 self.prefs.vm_scale = s;

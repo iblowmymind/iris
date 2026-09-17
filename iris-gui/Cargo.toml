@@ -129,11 +129,10 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSURL", "NSData", "NSError", "NSString", "NSArray",
 ] }
-# AppKit: the system menu bar, window tabbing, and the screen's usable area
-# (used to fit the window to the emulated display).
+# AppKit: the system menu bar and window tabbing (see src/macos_menu.rs).
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder",
-    "NSScreen", "NSWindow",
+    "NSWindow",
 ] }
 
 [[bin]]
