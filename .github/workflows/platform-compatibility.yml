@@ -7,7 +7,6 @@ on:
       - all-patches
       - fb-scaling
       - mac-gui
-      - mac-network
       - camera-fixes
       - packaging-fixes
       - storage-fixes
@@ -18,7 +17,6 @@ on:
       - all-patches
       - fb-scaling
       - mac-gui
-      - mac-network
       - camera-fixes
       - packaging-fixes
       - storage-fixes

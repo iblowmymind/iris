@@ -128,7 +128,7 @@ DHCP reply options provided:
 |--------|-------|
 | Subnet mask | `255.255.255.0` (or configured prefix) |
 | Router | Gateway IP (default `192.168.0.1`) |
-| DNS server | Gateway IP (default `192.168.0.1`) |
+| DNS server | `8.8.8.8` (guest DNS queries are forwarded to the host's DNS server whatever address they are sent to) |
 | Lease time | 86400 s (24 h) |
 
 ### NAT
@@ -137,13 +137,12 @@ All outbound TCP, UDP, and ICMP traffic from the guest is NATed through the
 host's network.
 
 ICMP ping to the gateway IP is answered locally by the emulator (no host
-network needed), so it always works. On macOS, guest UDP DNS queries use the
-system resolver, including VPN DNS settings. Resolver changes take effect on
-subsequent queries without restarting the emulator. Other platforms use
-`8.8.8.8` by default. DNS lookups run separately from the NAT processing loop.
-
-The gateway also handles UDP DNS queries sent to a manually configured DNS
-address in the guest. Responses use that address as their source.
+network needed), so it always works.  Guest UDP DNS queries are forwarded to
+the host's configured DNS server — the first IPv4 `nameserver` in
+`/etc/resolv.conf` on macOS/Linux, or the DNS server of the active adapter on
+Windows — so a VPN's DNS is used when one is connected. It is re-read every few
+seconds, so connecting or disconnecting a VPN needs no restart. If the host has
+no IPv4 DNS server, `8.8.8.8` is used.
 
 ### Changing the subnet
 
