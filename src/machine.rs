@@ -1479,6 +1479,7 @@ impl Machine {
     /// Apply an in-memory checkpoint, restoring the guest to the state at
     /// the moment of capture. Skips disk IO and TOML string-parsing.
     fn apply_rollback_checkpoint(&mut self, cp: &RollbackCheckpoint) -> Result<(), String> {
+        self.check_snapshot_disk_support()?;
         self.stop();
         self.power_on_devices();
 
@@ -1587,6 +1588,7 @@ impl Machine {
     /// the monitor console — symbol lookups, device register reads —
     /// stayed unresponsive after every `jitcheck` for no reason).
     pub(crate) fn restore_live_checkpoint(&mut self, cp: &LiveCheckpoint) -> Result<(), String> {
+        self.check_snapshot_disk_support()?;
         self.stop();
 
         self.cpu.load_state(&cp.cpu)?;
@@ -1669,8 +1671,17 @@ impl Machine {
         self.restart_peripherals();
     }
 
+    fn check_snapshot_disk_support(&self) -> Result<(), String> {
+        self.hpc3.scsi().check_snapshot_support().map_err(|e| e.to_string())?;
+        if let Some(dev) = self.hpc3.scsi1() {
+            dev.check_snapshot_support().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Save full machine snapshot to `saves/<name>/`.
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        self.check_snapshot_disk_support()?;
         self.stop();
 
         let dir = std::path::PathBuf::from("saves").join(name);
@@ -1822,6 +1833,7 @@ impl Machine {
     /// pattern holds. The persistent JIT profile uses content_hash to skip
     /// stale entries (see `profile_stale` in dispatch.rs).
     fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
+        self.check_snapshot_disk_support()?;
         self.stop();
 
         // Any prior in-memory rollback checkpoint is now stale (it described

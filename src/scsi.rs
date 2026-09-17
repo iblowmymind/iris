@@ -131,6 +131,17 @@ impl DiskBackend {
             DiskBackend::ChdCd(cd) => cd.size(),
         }
     }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Direct(file) => file.sync_all(),
+            Self::Cow(cow) => cow.flush(),
+            #[cfg(feature = "chd")]
+            Self::ChdHd(hd) => hd.flush(),
+            #[cfg(feature = "chd")]
+            Self::ChdCd(_) => Ok(()),
+        }
+    }
 }
 
 /// What kind of target sits at this SCSI id.
@@ -300,11 +311,12 @@ impl ScsiDevice {
             };
             if let Some((base, diff, cow)) = info {
                 self.backend = None;
-                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
+                let result = crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false);
                 let base_str = base.to_str()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
                 let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
                 self.backend = Some(DiskBackend::ChdHd(reopened));
+                result?;
                 return Ok(1);
             }
         }
@@ -326,11 +338,12 @@ impl ScsiDevice {
             };
             if let Some((base, diff, cow)) = info {
                 self.backend = None;
-                let _ = std::fs::remove_file(&diff); // discard every overlay write
+                let result = std::fs::remove_file(&diff);
                 let base_str = base.to_str()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
                 let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
                 self.backend = Some(DiskBackend::ChdHd(reopened));
+                result?;
             }
         }
         Ok(())
@@ -339,6 +352,7 @@ impl ScsiDevice {
     /// Copy the COW overlay into `dest` and return its dirty sector set.
     /// Direct-mode / no-media devices return an empty list and create no file.
     pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
+        self.check_snapshot_support()?;
         match &mut self.backend {
             Some(DiskBackend::Cow(cow)) => cow.export_overlay(dest),
             _ => Ok(Vec::new()),
@@ -348,10 +362,20 @@ impl ScsiDevice {
     /// Replace the COW overlay with the contents of `source` and adopt
     /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
     pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
+        self.check_snapshot_support()?;
         match &mut self.backend {
             Some(DiskBackend::Cow(cow)) => cow.import_overlay(source, dirty),
             _ => Ok(()),
         }
+    }
+
+    pub fn check_snapshot_support(&self) -> io::Result<()> {
+        #[cfg(feature = "chd")]
+        if matches!(&self.backend, Some(DiskBackend::ChdHd(_))) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "Snapshots cannot capture CHD hard-disk state yet; use a raw disk with a COW overlay"));
+        }
+        Ok(())
     }
 
     /// Number of dirty sectors in the COW overlay (raw), or for a CHD a coarse
@@ -580,6 +604,16 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Illegal Request: Invalid command
         }
 
+        let minimum = match req.cdb[0] >> 5 {
+            1 | 2 => 10,
+            4 => 16,
+            5 => 12,
+            _ => 6,
+        };
+        if req.cdb.len() < minimum {
+            return Ok(self.check_condition(0x05, 0x24, 0x00));
+        }
+
         let lun = (req.cdb[1] >> 5) & 0x7;
 
         // For most commands, only LUN 0 is valid
@@ -626,8 +660,18 @@ impl ScsiDevice {
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            // No write-back cache to flush — our backend writes are already synchronous.
-            scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
+            scsi_cmd::SYNCHRONIZE_CACHE_10 => {
+                if self.is_cdrom() && self.backend.is_some() {
+                    ScsiResponse { status: 0x00, data: vec![] }
+                } else if let Some(backend) = &mut self.backend {
+                    match backend.flush() {
+                        Ok(()) => ScsiResponse { status: 0x00, data: vec![] },
+                        Err(_) => self.check_condition(0x03, 0x0c, 0x00),
+                    }
+                } else {
+                    self.check_condition(0x02, 0x3a, 0x00)
+                }
+            }
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
@@ -783,7 +827,15 @@ impl ScsiDevice {
     fn exec_write_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
         let lba = ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16) | ((cdb[4] as u64) << 8) | (cdb[5] as u64);
         let count = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
-        self.perform_write(lba, count, data_in)
+        let response = self.perform_write(lba, count, data_in)?;
+        if response.status == 0 && cdb[1] & 0x08 != 0 {
+            if let Some(backend) = &mut self.backend {
+                if backend.flush().is_err() {
+                    return Ok(self.check_condition(0x03, 0x0c, 0x00));
+                }
+            }
+        }
+        Ok(response)
     }
 
     fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
@@ -792,6 +844,18 @@ impl ScsiDevice {
                 status: 0x02, // Check Condition
                 data: vec![],
             });
+        }
+
+        if self.backend.is_none() {
+            return Ok(self.check_condition(0x02, 0x3a, 0x00));
+        }
+        if count == 0 {
+            return Ok(ScsiResponse { status: 0x00, data: vec![] });
+        }
+
+        let sectors = self.size / self.logical_block_size;
+        if count > 0 && (lba >= sectors || count as u64 > sectors - lba) {
+            return Ok(self.check_condition(0x05, 0x21, 0x00));
         }
 
         let Some(data) = data_in else {
@@ -1314,5 +1378,35 @@ impl ScsiDevice {
         let dlen = (data.len() as u32) - 4;
         data[0..4].copy_from_slice(&dlen.to_be_bytes());
         Ok(ScsiResponse { status: 0x00, data })
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_write_does_not_extend_or_modify_disk() {
+        let path = std::env::temp_dir().join(format!("iris-scsi-bounds-{}.raw", std::process::id()));
+        std::fs::write(&path, vec![0x11; 1024]).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut disk = ScsiDevice::new(DiskBackend::Direct(file), 1024, false, String::new(), vec![]);
+        let response = disk.perform_write(1, 2, Some(&vec![0xff; 1024])).unwrap();
+        assert_eq!(response.status, 2);
+        assert_eq!(disk.pending_sense[12], 0x21);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0x11; 1024]);
+        assert_eq!(disk.perform_write(0, 0, None).unwrap().status, 0);
+        drop(disk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn short_cdb_returns_check_condition() {
+        let mut disk = ScsiDevice::new_empty_cdrom();
+        for cdb in [vec![scsi_cmd::READ_10], vec![scsi_cmd::READ_10; 6]] {
+            let response = disk.request(&ScsiRequest { cdb, data_len: ScsiDataLength::Unlimited, data_in: None }).unwrap();
+            assert_eq!(response.status, 2);
+            assert_eq!(disk.pending_sense[12], 0x24);
+        }
     }
 }

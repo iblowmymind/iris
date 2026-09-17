@@ -684,6 +684,14 @@ impl Wd33c93a {
         Ok(out)
     }
 
+    pub fn check_snapshot_support(&self) -> std::io::Result<()> {
+        let state = self.state.lock();
+        for dev in state.devices.iter().flatten() {
+            dev.check_snapshot_support()?;
+        }
+        Ok(())
+    }
+
     /// Replace each COW overlay with its saved counterpart in `dir` and
     /// adopt the matching dirty sector set. Devices with no corresponding
     /// entry in `dirty_sets` keep their current overlay untouched.
@@ -693,6 +701,9 @@ impl Wd33c93a {
         dirty_sets: &[(usize, Vec<u64>)],
     ) -> std::io::Result<()> {
         let mut state = self.state.lock();
+        if dirty_sets.iter().any(|(id, _)| *id >= state.devices.len()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Snapshot SCSI ID out of range"));
+        }
         for (id, dirty) in dirty_sets {
             if let Some(dev) = &mut state.devices[*id] {
                 if dev.is_cow() {
