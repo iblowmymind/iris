@@ -6,7 +6,7 @@ use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
-use crate::config::{AudioConfig, NetworkConfig};
+use crate::config::{AudioConfig, NetworkConfig, RtcOffset};
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::Ioc;
 use crate::ds1x86::Ds1x86;
@@ -576,6 +576,21 @@ fn start_transaction(&mut self) {
         // RX channel (id=10): respect ROWN — only write if HPC3 owns the descriptor
         if self.id == 10 && !self.rown {
             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — ROWN=0 (host owns descriptor, cbp={:08x})", self.id, self.cbp); }
+            if self.eox {
+                // End of chain, and the host owns it: the ring is exhausted,
+                // and the hardware stops here rather than running off the end.
+                //
+                // Stopping is also the only thing the driver can see. NetBSD's
+                // sq_rxintr re-arms the receive channel only inside
+                // `if ((status & enetr_ctl_active) == 0)`, and that ACTIVE bit
+                // is this `ctrl` bit. Staying active while refusing every frame
+                // tells the driver there is nothing to fix: we wait for a
+                // descriptor the host will not hand back until it reaps a frame
+                // we cannot deliver. A bulk transfer wedges a few MB in and the
+                // interface stays mute until reboot.
+                if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: receive chain exhausted at EOX — stopping channel", self.id); }
+                self.ctrl &= !self.active_mask;
+            }
             return (DmaStatus(DmaStatus::ROWN), None);
         }
 
@@ -1045,14 +1060,15 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, AudioConfig::default(), "nvram.bin".to_string(), true)
+        Self::with_net(eeprom, ioc, guinness, heartbeat, NetworkConfig::default(), false, AudioConfig::default(), "nvram.bin".to_string(), RtcOffset::default(), true)
     }
 
     /// `no_audio` skips HAL2 audio init (used by `--noaudio` and also by full
     /// `--headless`, which can't run audio in CI).
     /// `nvram_path` is the on-disk NVRAM file (loaded at startup, default save
-    /// target for `iris-ci rtc-save`).
-    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, scsi_deferred_int: bool) -> Self {
+    /// target for `iris-ci rtc-save`); `rtc_offset` shifts the RTC's
+    /// host-time seed (`[rtc_offset]`).
+    pub fn with_net(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, net: NetworkConfig, no_audio: bool, audio: AudioConfig, nvram_path: String, rtc_offset: RtcOffset, scsi_deferred_int: bool) -> Self {
         let nfs = net.nfs;
         let port_forwards = net.port_forward;
         let subnet = net.nat_subnet.unwrap_or_default();
@@ -1060,7 +1076,7 @@ impl Hpc3 {
         let pcap_interface = net.pcap_interface;
         let nfs_pcap_ip = net.nfs_pcap_ip;
         let tftp_dir = net.tftp_dir.clone();
-        let rtc = Arc::new(Ds1x86::new(8192, nvram_path));
+        let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
         let state = Arc::new(Mutex::new(Hpc3State {
@@ -2233,6 +2249,7 @@ mod tests {
             AudioConfig::default(),
             // Empty path: nothing on disk to load, and nothing written back.
             String::new(),
+            RtcOffset::default(),
             true,
         )
     }
@@ -2317,5 +2334,59 @@ mod tests {
             assert!(c.even_high, "chan {} lost even_high", i);
             assert!(c.endian, "chan {} lost endian", i);
         }
+    }
+}
+
+#[cfg(test)]
+mod enet_rx_chain_tests {
+    use super::*;
+
+    /// The receive channel as NetBSD's `sq` leaves it once the ring is full:
+    /// started, sitting on the end-of-chain descriptor, which the host still
+    /// owns because the driver has not reaped and re-armed it yet.
+    fn rx_channel_on_an_exhausted_chain(hpc3: &Hpc3) {
+        let mut c = hpc3.pdma_channels[10].lock();
+        c.active_mask = ENET_RX_CTRL_ACTIVE;
+        c.ctrl |= c.active_mask;   // the driver started it
+        c.eox = true;              // ...and this is the last descriptor
+        c.rown = false;            // ...which the host, not the HPC, owns
+    }
+
+    fn hpc3_for_test() -> Hpc3 {
+        Hpc3::with_net(
+            Arc::new(Mutex::new(Eeprom93c56::new())),
+            Ioc::new_ci(true),
+            true,
+            Arc::new(AtomicU64::new(0)),
+            NetworkConfig::default(),
+            true,
+            AudioConfig::default(),
+            String::new(),
+            RtcOffset::default(),
+            true,
+        )
+    }
+
+    /// A refusal the driver cannot see is a deadlock. `sq_rxintr` re-arms the
+    /// receive channel only inside `if ((status & enetr_ctl_active) == 0)`, and
+    /// `enetr_ctl`'s ACTIVE bit is this channel's `ctrl` bit. So a channel that
+    /// refuses every frame while still reporting itself active tells the driver
+    /// there is nothing to fix: we wait for the host to hand back a descriptor,
+    /// the host waits for a completed frame to reap, and the interface is mute
+    /// until reboot. That is what wedges a NetBSD bulk transfer a few MB in.
+    #[test]
+    fn an_exhausted_receive_chain_stops_the_channel() {
+        let hpc3 = hpc3_for_test();
+        rx_channel_on_an_exhausted_chain(&hpc3);
+
+        let (status, _) = hpc3.pdma_channels[10].lock().dma_write(0x42, false);
+        assert!(status.refused(), "a host-owned descriptor cannot take the frame");
+
+        let c = hpc3.pdma_channels[10].lock();
+        assert!(
+            !c.is_active(),
+            "the channel refused the frame but still reports ACTIVE, so \
+             sq_rxintr's restart path never runs and receive never resumes",
+        );
     }
 }

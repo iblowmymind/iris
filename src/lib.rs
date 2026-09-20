@@ -142,6 +142,11 @@ pub mod build_features {
             ("developer", cfg!(feature = "developer")),
             ("developer_ip7", cfg!(feature = "developer_ip7")),
             ("debug_cache", cfg!(feature = "debug_cache")),
+            ("jitv2_lockstep", cfg!(feature = "jitv2_lockstep")),
+            ("jitv2_smc_check", cfg!(feature = "jitv2_smc_check")),
+            ("fetchverify", cfg!(feature = "fetchverify")),
+            ("j2wp", cfg!(feature = "j2wp")),
+            ("llstats", cfg!(feature = "llstats")),
         ];
         FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect()
     }
@@ -174,6 +179,7 @@ pub mod mem;
 #[cfg(feature = "ppmem")]
 pub mod ppmem;
 pub mod mc;
+pub mod mc_vdma;
 pub mod machine;
 pub mod eeprom_93c56;
 pub mod platform;
@@ -262,6 +268,7 @@ pub mod jitv2_html_default;
 pub mod jitv2_html_j2wp;
 pub mod jit_feedback;
 pub mod crash_diag;
+pub mod hwwatch;
 
 #[cfg(test)]
 mod platform_profile_tests;

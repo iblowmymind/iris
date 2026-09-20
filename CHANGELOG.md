@@ -23,6 +23,12 @@ is easiest to understand by reading the commit.
   diagnostic counters were moved off the hot path behind the new default-on
   `rexdiag` feature, so a last-drops build can drop them with
   `--no-default-features` (`f1d0fcb`).
+- **Crash fix: `rex-jit` CIDMATCH probe on aux-plane draws.** A draw into an
+  overlay plane (OLAY/PUP/CID) with CID checking live re-derived the CID probe's
+  offset against `fb_rgb` while the pixel pointer was already `fb_aux`-based,
+  reading `fb_aux + (fb_aux - fb_rgb) + off` — a wild pointer that segfaulted the
+  REX3 thread under X11. `Dm1::use_aux()` now picks the base in both shader
+  emitters (`rules/rex3/cidmatch-aux-plane-base.md`).
 - The GFIFO push is retryable, and a shader rejected by a full compile queue can
   be requested again (`rules/testing/rex-jit-queue-retry.md`).
 - `CIDMATCH` is a mask of permitted CIDs, not an equality value
@@ -36,6 +42,10 @@ is easiest to understand by reading the commit.
   and Count/IP7 frequency inference are gone; a constant rate proved more stable.
   IRIX reports it as a 66 MHz CPU. `[clock] fixed_mhz` / `--clock-fixed-mhz`
   override it.
+- **Guest clock offset** (`[rtc_offset]`, iris-gui General → Real-time clock).
+  Start the DS1386 RTC shifted from host time by signed years, months, days,
+  hours, minutes and seconds, e.g. `years = -18`. Applied only when the RTC is
+  seeded from the host at startup; clamped to the chip's 1970–2039 range.
 - IP7 delivery improved for Linux guests' timer checks and calibration.
 - Misaligned-fetch exception, and Config.K0 cache modes including the reserved
   ones (`rules/irix/cache-attributes-and-fetch-alignment.md`).
@@ -45,6 +55,18 @@ is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **Compile churn avoidance (`j2wp`).** Each page now remembers the bytes its
+  last compile decoded, the entry points it published and the FR mode it was
+  built for. A later compile request whose generation moved but whose *decoded*
+  words are all unchanged re-validates the installed function instead of
+  recompiling it — the common case where code and data share a 4KB page, so a
+  write to the data bumps the generation and used to force a full
+  analyze+codegen+finalize that emitted byte-identical code. On an IRIX 6.5
+  boot this skips ~286k compiles, 98% of everything checked. Costs ~20MB
+  (`PhysicalCodePage` 720 → 4976 bytes across the 4096-slot pool). `j2 status`
+  and `j2 pcp` report the skipped/recompiled split (since last flush, and
+  available in `lightning` builds, not just `developer`). See
+  `rules/jitv2/compile-churn-avoidance-snapshot.md`.
 - Inline load/store for the R5000 cache model, not only the R4400.
 - Physical code pages are found through a flat pfn array instead of a hash map;
   PC/BD stores are emitted only when needed; the last instruction on a page and
