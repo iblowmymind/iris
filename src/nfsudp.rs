@@ -110,18 +110,67 @@ impl NfsBacking {
 
     /// The absolute host path for a fileid. Guaranteed within `root` because the
     /// relative paths only ever contain validated, normal components.
+    ///
+    /// Containment here is *lexical*. It is not enough on its own, because a
+    /// symlink on the host resolves outside the export while spelling a path
+    /// inside it — use [`Self::safe_abs`] for anything that touches the file.
     pub fn abs_of(&self, id: u64) -> Option<PathBuf> {
         self.rel_of(id).map(|rel| self.root.join(rel))
     }
 
+    /// Whether any component of root-relative `rel` — including the last — is a
+    /// symlink on the host.
+    ///
+    /// The path validation on the wire rejects `..` and separators, so the guest
+    /// cannot *spell* an escape. A symlink already sitting in the exported
+    /// directory is a different matter: `lookup` only ever `lstat`s the final
+    /// component, so `evil -> /etc` is interned happily, and every operation
+    /// afterwards (`File::open`, `read_dir`, `fs::write`) follows it. Since this
+    /// server implements no READLINK or SYMLINK procedure, symlinks are not part
+    /// of the guest-visible filesystem at all, and the safe answer is to make
+    /// them invisible rather than traversable.
+    fn has_symlink_component(&self, rel: &Path) -> bool {
+        let mut probe = self.root.clone();
+        for comp in rel.components() {
+            probe.push(comp);
+            match std::fs::symlink_metadata(&probe) {
+                Ok(md) => {
+                    if md.file_type().is_symlink() {
+                        return true;
+                    }
+                }
+                // Doesn't exist yet (a path being created): nothing to follow.
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// `abs_of`, but only for a path that is genuinely inside the export: no
+    /// component may be a symlink. Everything that opens, reads, writes or lists
+    /// a host path goes through this.
+    ///
+    /// This closes the case that matters — a symlink planted in the export before
+    /// or during the session. It does not close a host process swapping a
+    /// directory for a symlink between this check and the operation that follows;
+    /// that needs descriptor-relative, no-follow syscalls, and is noted as
+    /// outstanding in the storage audit.
+    fn safe_abs(&self, id: u64) -> Option<PathBuf> {
+        let rel = self.rel_of(id)?;
+        if self.has_symlink_component(rel) {
+            return None;
+        }
+        Some(self.root.join(rel))
+    }
+
     /// Whether `id` is a directory the guest can list.
     pub fn is_dir(&self, id: u64) -> bool {
-        self.abs_of(id).map(|p| p.is_dir()).unwrap_or(false)
+        self.safe_abs(id).map(|p| p.is_dir()).unwrap_or(false)
     }
 
     /// Synthetic attributes for `id`, or `None` if it no longer exists.
     pub fn attr(&self, id: u64) -> Option<Attr> {
-        let abs = self.abs_of(id)?;
+        let abs = self.safe_abs(id)?;
         let md = std::fs::symlink_metadata(&abs).ok()?;
         Some(self.attr_from(id, &md))
     }
@@ -149,8 +198,11 @@ impl NfsBacking {
         }
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
+        if self.has_symlink_component(&rel) {
+            return None; // a host symlink is not part of the exported tree
+        }
         let abs = self.root.join(&rel);
-        if !abs.symlink_metadata().is_ok() {
+        if abs.symlink_metadata().is_err() {
             return None;
         }
         Some(self.intern(rel))
@@ -161,7 +213,7 @@ impl NfsBacking {
     /// `..` fileid to match what LOOKUP interns.
     pub fn readdir(&mut self, dirid: u64) -> Option<Vec<(Vec<u8>, u64, Attr)>> {
         let dir_rel = self.rel_of(dirid)?.clone();
-        let abs = self.root.join(&dir_rel);
+        let abs = self.safe_abs(dirid)?;
         let mut out = Vec::new();
         for (name, id) in [(b".".to_vec(), dirid), (b"..".to_vec(), self.parent_id(dirid)?)] {
             if let Some(attr) = self.attr(id) {
@@ -173,6 +225,11 @@ impl NfsBacking {
             let name = name_bytes(&ent.file_name());
             // Skip anything that wouldn't round-trip as a safe component.
             if valid_component(&name).is_none() {
+                continue;
+            }
+            // Skip host symlinks: they are not part of the exported tree, and
+            // listing one the guest then cannot LOOKUP only produces confusion.
+            if ent.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
                 continue;
             }
             let rel = dir_rel.join(ent.file_name());
@@ -188,7 +245,7 @@ impl NfsBacking {
     /// whether end-of-file was reached.
     pub fn read(&self, id: u64, offset: u64, count: u32) -> Option<(Vec<u8>, bool)> {
         use std::io::{Read, Seek, SeekFrom};
-        let abs = self.abs_of(id)?;
+        let abs = self.safe_abs(id)?;
         let mut f = std::fs::File::open(&abs).ok()?;
         let len = f.metadata().ok()?.len();
         f.seek(SeekFrom::Start(offset)).ok()?;
@@ -208,23 +265,32 @@ impl NfsBacking {
     }
 
     /// Write `data` at `offset` to file `id`, returning the post-write attrs.
+    ///
+    /// Synced before returning. Both WRITE handlers answer `committed =
+    /// FILE_SYNC`, which tells the client the data is on stable storage and
+    /// entitles it to drop the page from its own cache and skip COMMIT. A
+    /// `flush()` on a `File` is a no-op, so that promise was previously worth
+    /// nothing at all past the host's page cache.
     pub fn write(&mut self, id: u64, offset: u64, data: &[u8]) -> Option<Attr> {
         use std::io::{Seek, SeekFrom, Write};
-        let abs = self.abs_of(id)?;
+        let abs = self.safe_abs(id)?;
         let mut f = std::fs::OpenOptions::new().write(true).open(&abs).ok()?;
         f.seek(SeekFrom::Start(offset)).ok()?;
         f.write_all(data).ok()?;
-        f.flush().ok()?;
+        f.sync_all().ok()?;
         self.attr(id)
     }
 
     /// Truncate (or extend) file `id` to `size` bytes. Used by SETATTR.
     pub fn truncate(&mut self, id: u64, size: u64) -> bool {
-        let Some(abs) = self.abs_of(id) else { return false };
+        let Some(abs) = self.safe_abs(id) else { return false };
         std::fs::OpenOptions::new()
             .write(true)
             .open(&abs)
-            .and_then(|f| f.set_len(size))
+            .and_then(|f| {
+                f.set_len(size)?;
+                f.sync_all()
+            })
             .is_ok()
     }
 
@@ -232,6 +298,9 @@ impl NfsBacking {
     pub fn create(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
+        if self.has_symlink_component(&rel) {
+            return None;
+        }
         let abs = self.root.join(&rel);
         std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&abs).ok()?;
         Some(self.intern(rel))
@@ -241,6 +310,9 @@ impl NfsBacking {
     pub fn mkdir(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
+        if self.has_symlink_component(&rel) {
+            return None;
+        }
         std::fs::create_dir(self.root.join(&rel)).ok()?;
         Some(self.intern(rel))
     }
@@ -259,14 +331,36 @@ impl NfsBacking {
         let Some(comp) = valid_component(name) else { return false };
         let Some(parent) = self.rel_of(dirid) else { return false };
         let rel = parent.join(&comp);
+        if self.has_symlink_component(&rel) {
+            return false;
+        }
         let abs = self.root.join(&rel);
         let ok = if dir { std::fs::remove_dir(&abs) } else { std::fs::remove_file(&abs) }.is_ok();
         if ok {
-            if let Some(id) = self.path_to_id.remove(&rel) {
+            self.retire_subtree(&rel);
+        }
+        ok
+    }
+
+    /// Drop `rel` and everything under it from the handle maps.
+    ///
+    /// Retiring the whole subtree, not just the exact path, is what stops a
+    /// stale handle from coming back to life: leave `dir/sub/file` mapped after
+    /// `dir` goes away and the next thing created at that path inherits the old
+    /// handle, so a guest that still holds it reads and writes a file it never
+    /// opened.
+    fn retire_subtree(&mut self, rel: &Path) {
+        let victims: Vec<PathBuf> = self
+            .path_to_id
+            .keys()
+            .filter(|p| *p == rel || p.starts_with(rel))
+            .cloned()
+            .collect();
+        for p in victims {
+            if let Some(id) = self.path_to_id.remove(&p) {
                 self.id_to_path.remove(&id);
             }
         }
-        ok
     }
 
     /// Rename `from_name` in `from_dir` to `to_name` in `to_dir`.
@@ -279,13 +373,45 @@ impl NfsBacking {
         };
         let from_rel = fp.join(&fc);
         let to_rel = tp.join(&tc);
+        if self.has_symlink_component(&from_rel) || self.has_symlink_component(&to_rel) {
+            return false;
+        }
         if std::fs::rename(self.root.join(&from_rel), self.root.join(&to_rel)).is_err() {
             return false;
         }
-        // Re-point the moved id at its new path so its handle stays valid.
-        if let Some(id) = self.path_to_id.remove(&from_rel) {
-            self.id_to_path.insert(id, to_rel.clone());
-            self.path_to_id.insert(to_rel, id);
+
+        // Rename may have clobbered whatever was at the destination. Its handles
+        // now name content that no longer exists, so retire them rather than
+        // letting them alias the file that just moved on top.
+        if self.path_to_id.get(&to_rel) != self.path_to_id.get(&from_rel) {
+            self.retire_subtree(&to_rel);
+        }
+
+        // Re-point the moved id *and every descendant* at the new prefix. Moving
+        // only the exact path left every handle below a renamed directory
+        // pointing at a path that no longer exists — the guest saw ESTALE
+        // mid-operation, and worse, a later file created at one of those old
+        // paths would silently adopt the handle.
+        let moved: Vec<PathBuf> = self
+            .path_to_id
+            .keys()
+            .filter(|p| **p == from_rel || p.starts_with(&from_rel))
+            .cloned()
+            .collect();
+        for old in moved {
+            let Some(id) = self.path_to_id.remove(&old) else { continue };
+            // The renamed path itself takes `to_rel` verbatim. Going through
+            // `join` with the empty tail `strip_prefix` yields for it would
+            // append a separator, and a regular file's path with a trailing
+            // slash stops opening (ENOTDIR).
+            let new = match old.strip_prefix(&from_rel) {
+                Ok(tail) if tail.as_os_str().is_empty() => to_rel.clone(),
+                Ok(tail) => to_rel.join(tail),
+                // `starts_with` matched, so this cannot fail; be safe anyway.
+                Err(_) => to_rel.clone(),
+            };
+            self.id_to_path.insert(id, new.clone());
+            self.path_to_id.insert(new, id);
         }
         true
     }
@@ -1574,6 +1700,133 @@ mod tests {
         assert!(!root.join("dir/x").exists());
         assert!(b.remove(ROOT_ID, b"y"));
         assert!(b.rmdir(ROOT_ID, b"dir"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symlink already sitting in the exported directory must not become a way
+    /// out of it. The guest cannot spell an escape, but it can LOOKUP a name the
+    /// host has pointed elsewhere, and every operation after that follows it.
+    #[test]
+    #[cfg(unix)]
+    fn host_symlinks_cannot_escape_the_export() {
+        let root = temp_export();
+        // Something outside the export, with content we would notice.
+        let outside = root.parent().unwrap().join(format!(
+            "iris-nfs-outside-{}-{}.txt",
+            std::process::id(),
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, b"SECRET").unwrap();
+        let outside_dir = root.parent().unwrap().join(format!(
+            "iris-nfs-outside-dir-{}-{}",
+            std::process::id(),
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("inside.txt"), b"ALSO SECRET").unwrap();
+
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, root.join("escapedir")).unwrap();
+
+        let mut b = NfsBacking::new(&root);
+
+        // The symlink itself is not lookup-able, and not listed.
+        assert!(b.lookup(ROOT_ID, b"escape").is_none(), "a host symlink must not resolve");
+        assert!(b.lookup(ROOT_ID, b"escapedir").is_none());
+        let names: Vec<Vec<u8>> =
+            b.readdir(ROOT_ID).unwrap().into_iter().map(|(n, _, _)| n).collect();
+        assert!(!names.contains(&b"escape".to_vec()), "symlinks must not be listed");
+        assert!(!names.contains(&b"escapedir".to_vec()));
+
+        // Nor is anything through it — the classic intermediate-component escape.
+        // (`lookup` needs a dir id; interning the symlink is what we just blocked,
+        // so drive it the way a guest would have to and confirm there is no route.)
+        assert!(b.lookup(ROOT_ID, b"escapedir").is_none());
+
+        // And creating through a symlinked directory is refused too.
+        assert!(b.create(ROOT_ID, b"escape").is_none(), "must not truncate through a symlink");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"SECRET", "the target is untouched");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&outside).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
+    }
+
+    /// Renaming a directory must carry its descendants' handles with it. A handle
+    /// the guest is mid-operation on should keep naming the same file.
+    #[test]
+    fn directory_rename_keeps_descendant_handles_valid() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let d = b.mkdir(ROOT_ID, b"olddir").unwrap();
+        let sub = b.mkdir(d, b"sub").unwrap();
+        let f = b.create(sub, b"deep.txt").unwrap();
+        b.write(f, 0, b"payload").unwrap();
+
+        assert!(b.rename(ROOT_ID, b"olddir", ROOT_ID, b"newdir"));
+
+        // The descendant handles still resolve, and to the same content.
+        assert_eq!(b.rel_of(f).unwrap(), &PathBuf::from("newdir/sub/deep.txt"));
+        assert_eq!(b.rel_of(sub).unwrap(), &PathBuf::from("newdir/sub"));
+        assert_eq!(b.read(f, 0, 16).unwrap().0, b"payload");
+        assert!(b.attr(f).is_some(), "the file handle survived the rename");
+        assert!(b.is_dir(sub));
+
+        // A file re-created at the *old* path must not inherit the old handle.
+        let d2 = b.mkdir(ROOT_ID, b"olddir").unwrap();
+        let sub2 = b.mkdir(d2, b"sub").unwrap();
+        let imposter = b.create(sub2, b"deep.txt").unwrap();
+        assert_ne!(imposter, f, "a new file must get a new handle");
+        assert_eq!(b.read(f, 0, 16).unwrap().0, b"payload", "the old handle still reads its own file");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Renaming over an existing file must retire the clobbered file's handle
+    /// rather than leaving it pointing at the content that replaced it.
+    #[test]
+    fn rename_over_a_file_retires_its_handle() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let victim = b.create(ROOT_ID, b"victim").unwrap();
+        b.write(victim, 0, b"OLD").unwrap();
+        let mover = b.create(ROOT_ID, b"mover").unwrap();
+        b.write(mover, 0, b"NEW").unwrap();
+
+        assert!(b.rename(ROOT_ID, b"mover", ROOT_ID, b"victim"));
+        assert!(
+            b.rel_of(victim).is_none(),
+            "the clobbered file's handle must be retired, not aliased to the new content"
+        );
+        assert_eq!(b.rel_of(mover).unwrap(), &PathBuf::from("victim"));
+        assert_eq!(b.read(mover, 0, 8).unwrap().0, b"NEW");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Removing a directory tree must retire the handles beneath it.
+    #[test]
+    fn remove_retires_handles() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let f = b.create(ROOT_ID, b"gone").unwrap();
+        assert!(b.remove(ROOT_ID, b"gone"));
+        assert!(b.rel_of(f).is_none(), "handle retired with the file");
+        // A new file at the same name gets a fresh handle.
+        let f2 = b.create(ROOT_ID, b"gone").unwrap();
+        assert_ne!(f, f2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// WRITE answers `committed = FILE_SYNC`, so the bytes have to be on the
+    /// medium before the reply goes out — the client is entitled to forget them.
+    #[test]
+    fn write_reports_file_sync_and_means_it() {
+        let root = temp_export();
+        let mut b = NfsBacking::new(&root);
+        let f = b.create(ROOT_ID, b"durable.txt").unwrap();
+        let attr = b.write(f, 0, b"on stable storage").unwrap();
+        assert_eq!(attr.size, 17);
+        // Read it back through the host, bypassing our own handle entirely.
+        assert_eq!(std::fs::read(root.join("durable.txt")).unwrap(), b"on stable storage");
         std::fs::remove_dir_all(&root).ok();
     }
 

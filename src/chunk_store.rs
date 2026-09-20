@@ -38,6 +38,13 @@ const CHUNK_EXT: &str = "chunk";
 /// 32-byte BLAKE3 digest.
 pub type ChunkHash = [u8; 32];
 
+/// Per-process counter making each in-flight temp chunk name unique.
+fn next_tmp_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct ChunkStore {
     root: PathBuf,
 }
@@ -53,40 +60,87 @@ impl ChunkStore {
 
     /// Hash `data`, write it as `saves/.cas/<hex2>/<hex62>.chunk` if absent,
     /// return the hash. Idempotent — concurrent saves of the same chunk are
-    /// safe; the second call is a no-op.
+    /// safe; the second call verifies what is there and returns.
     ///
-    /// Crash-safety: chunks are written to a `.tmp` sibling then renamed
-    /// (atomic on POSIX), so a partial write never appears under the final
-    /// content-addressed name. We deliberately skip per-chunk `fsync` —
+    /// Crash-safety: chunks are written to a per-writer `.tmp` sibling then
+    /// renamed (atomic on POSIX), so a partial write never appears under the
+    /// final content-addressed name. We deliberately skip per-chunk `fsync` —
     /// 4096 fsyncs per snapshot was costing ~20 s on APFS for the first
     /// save of a 256 MB image. If the process dies mid-save the manifest
     /// (`chunks.bin`) hasn't been written yet, so any complete chunks are
-    /// just orphaned bytes that `gc` will sweep later.
+    /// just orphaned bytes that `gc` will sweep later. What that trade does
+    /// leave open is a chunk whose bytes never reached the platter, which is
+    /// why reuse and every read re-hash the content rather than trusting the
+    /// name.
     pub fn put(&self, data: &[u8]) -> io::Result<ChunkHash> {
         let hash: ChunkHash = blake3::hash(data).into();
         let path = self.path_for(&hash);
+        // Reusing an existing chunk means trusting it. Verify it rather than
+        // taking its filename's word: a chunk truncated by a half-finished write
+        // or damaged on disk would otherwise be silently adopted by every later
+        // snapshot that hashes to it, and restore would load it as RAM.
         if path.exists() {
-            return Ok(hash);
+            match self.read_verified(&hash, &path) {
+                Ok(_) => return Ok(hash),
+                Err(e) => {
+                    eprintln!(
+                        "iris: CAS chunk {} failed verification ({}); rewriting it",
+                        path.display(),
+                        e
+                    );
+                }
+            }
         }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("chunk.tmp");
-        {
+        // A temp name unique to this writer. Derived purely from the hash, two
+        // concurrent puts of the same chunk shared one temp file, so one could
+        // truncate the other's partial write and the loser's rename could then
+        // publish a short chunk under the content-addressed name.
+        let tmp = path.with_extension(format!("chunk.{}.{}.tmp", std::process::id(), next_tmp_seq()));
+        let write = || -> io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(data)?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
-        // Rename is atomic on POSIX. If two threads raced, the loser's
-        // rename overwrites the winner's identical content — fine.
-        fs::rename(&tmp, &path)?;
+        // Rename is atomic on POSIX. If two writers raced, the loser's rename
+        // overwrites the winner's identical content — fine, both are complete.
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(hash)
     }
 
     pub fn get(&self, hash: &ChunkHash) -> io::Result<Vec<u8>> {
         let path = self.path_for(hash);
-        let mut f = fs::File::open(&path)?;
+        self.read_verified(hash, &path)
+    }
+
+    /// Read a chunk and check its content against the hash it is stored under.
+    /// The store is content-addressed, so this is a free integrity check on
+    /// every read — and the only thing standing between a damaged chunk file and
+    /// a restored machine whose RAM quietly differs from what was saved.
+    fn read_verified(&self, hash: &ChunkHash, path: &Path) -> io::Result<Vec<u8>> {
+        let mut f = fs::File::open(path)?;
         let mut data = Vec::with_capacity(CHUNK_SIZE);
         f.read_to_end(&mut data)?;
+        let actual: ChunkHash = blake3::hash(&data).into();
+        if actual != *hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "chunk {} hashes to {} — content does not match its name",
+                    path.display(),
+                    hex_encode(&actual)
+                ),
+            ));
+        }
         Ok(data)
     }
 
@@ -108,6 +162,16 @@ impl ChunkStore {
             for chunk in fs::read_dir(shard.path())? {
                 let chunk = chunk?;
                 let path = chunk.path();
+                // Sweep temp files a killed save left behind; nothing references
+                // them and their names never parse as a hash.
+                if path.extension().is_some_and(|e| e == "tmp") {
+                    let size = chunk.metadata().map(|m| m.len()).unwrap_or(0);
+                    if fs::remove_file(&path).is_ok() {
+                        removed += 1;
+                        bytes_removed += size;
+                    }
+                    continue;
+                }
                 let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
                 let Some(hash) = parse_hex62(stem, &shard.file_name().to_string_lossy()) else { continue };
                 if !live.contains(&hash) {
@@ -302,6 +366,68 @@ mod tests {
             }
         }
         assert_eq!(count, 1, "two zero banks must dedupe to a single chunk");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk whose bytes no longer match its name must not be handed back as
+    /// if it were intact — restoring it would put different RAM into the machine
+    /// than the snapshot captured.
+    #[test]
+    fn get_rejects_a_chunk_whose_content_changed() {
+        let dir = unique_tmp_dir("verify");
+        let store = ChunkStore::new(&dir);
+        let h = store.put(b"the original content").unwrap();
+        assert_eq!(store.get(&h).unwrap(), b"the original content");
+
+        // Corrupt it in place, keeping the content-addressed name.
+        fs::write(store.path_for(&h), b"tampered!!!!!!!!!!!!").unwrap();
+        let err = store.get(&h).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("does not match its name"), "{err}");
+
+        // A later `put` of the real content notices and repairs it.
+        let h2 = store.put(b"the original content").unwrap();
+        assert_eq!(h2, h);
+        assert_eq!(store.get(&h).unwrap(), b"the original content");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A truncated chunk is the shape a killed save leaves behind; it must be
+    /// rejected too, not silently read short.
+    #[test]
+    fn get_rejects_a_truncated_chunk() {
+        let dir = unique_tmp_dir("trunc");
+        let store = ChunkStore::new(&dir);
+        let data = vec![0x5Au8; 4096];
+        let h = store.put(&data).unwrap();
+        fs::write(store.path_for(&h), &data[..1024]).unwrap();
+        assert!(store.get(&h).is_err(), "a short chunk must not pass verification");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two writers putting the same chunk must not be able to publish a partial
+    /// file under its final name. Checked through the temp-name property that
+    /// makes it impossible: no two in-flight puts share a path.
+    #[test]
+    fn concurrent_puts_use_distinct_temp_files() {
+        let dir = unique_tmp_dir("race");
+        let store = ChunkStore::new(&dir);
+        let data = vec![0xABu8; CHUNK_SIZE];
+        let hashes: Vec<ChunkHash> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| store.put(&data).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(hashes.windows(2).all(|w| w[0] == w[1]));
+        assert_eq!(store.get(&hashes[0]).unwrap(), data, "the published chunk is complete");
+        // No temp files survived.
+        for shard in fs::read_dir(dir.join(".cas")).unwrap() {
+            for f in fs::read_dir(shard.unwrap().path()).unwrap() {
+                let p = f.unwrap().path();
+                assert!(p.extension().is_some_and(|e| e == "chunk"), "leftover {}", p.display());
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

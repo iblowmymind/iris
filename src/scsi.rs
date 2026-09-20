@@ -14,6 +14,26 @@ pub fn get_cdb_length(opcode: u8) -> usize {
     }
 }
 
+/// Bytes the handlers in this file actually read: 6 for a group-0 command, 10 for
+/// a group-1/2 one. Capped at 10 because nothing here decodes a 12-byte CDB's
+/// tail.
+const MIN_DECODED_CDB: usize = 10;
+
+/// Whether `cdb` is too short for the command it names to be decoded.
+///
+/// Every handler below indexes at least the LUN byte, and the 10-byte commands
+/// go as far as byte 8. A guest that arms a transfer count of one and issues
+/// TRANSFER_INFO hands the controller a one-byte "CDB", so this has to be
+/// checked rather than assumed — indexing past the end is a panic, and the
+/// emulator taking the host process down with it is a worse answer than CHECK
+/// CONDITION.
+fn cdb_too_short(cdb: &[u8]) -> bool {
+    match cdb.first() {
+        Some(&op) => cdb.len() < get_cdb_length(op).min(MIN_DECODED_CDB),
+        None => true,
+    }
+}
+
 pub mod scsi_cmd {
     pub const TEST_UNIT_READY: u8 = 0x00;
     pub const REQUEST_SENSE: u8 = 0x03;
@@ -129,6 +149,23 @@ impl DiskBackend {
             DiskBackend::ChdHd(hd) => hd.size(),
             #[cfg(feature = "chd")]
             DiskBackend::ChdCd(cd) => cd.size(),
+        }
+    }
+
+    /// Push everything written so far to stable storage. Answers SYNCHRONIZE
+    /// CACHE and a forced-unit-access write: MODE SENSE page 8 advertises a
+    /// write-back cache, so IRIX is entitled to assume that flushing it means
+    /// something. For the COW backend this is the only thing that persists the
+    /// dirty-sector map, so an unflushed exit there loses the whole overlay.
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            DiskBackend::Direct(file) => file.sync_all(),
+            DiskBackend::Cow(cow) => cow.flush(),
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdHd(hd) => hd.flush(),
+            // Read-only: nothing of ours is ever dirty.
+            #[cfg(feature = "chd")]
+            DiskBackend::ChdCd(_) => Ok(()),
         }
     }
 }
@@ -290,8 +327,8 @@ impl ScsiDevice {
         }
         #[cfg(feature = "chd")]
         {
-            // CHD: rebuild needs the file closed first, so extract the paths,
-            // drop the backend, flatten, then reopen with the same COW mode.
+            // CHD: both folds need the files closed first, so extract the paths,
+            // drop the backend, fold, then reopen with the same COW mode.
             let info = match &self.backend {
                 Some(DiskBackend::ChdHd(hd)) if hd.diff_dirty() => {
                     hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow()))
@@ -300,15 +337,44 @@ impl ScsiDevice {
             };
             if let Some((base, diff, cow)) = info {
                 self.backend = None;
-                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
-                let base_str = base.to_str()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
-                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
-                self.backend = Some(DiskBackend::ChdHd(reopened));
-                return Ok(1);
+                // Whatever happens below, the device must not be left without a
+                // backend: to the guest that is the disk vanishing mid-session.
+                // Reopen unconditionally and report the first real failure.
+                let folded = crate::chd_disk::commit_overlay(&base, &diff, &mut |_| {}, &|| false);
+                let reopened = self.reopen_chd(&base, cow);
+                return match (folded, reopened) {
+                    (Ok(n), Ok(())) => Ok(n),
+                    (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+                };
             }
         }
         Ok(0)
+    }
+
+    /// Reopen this device's CHD after a commit or reset closed it. Failing to
+    /// reopen leaves the device with no media, so say so loudly rather than
+    /// letting the guest discover a disk that stopped answering.
+    #[cfg(feature = "chd")]
+    fn reopen_chd(&mut self, base: &std::path::Path, cow: bool) -> io::Result<()> {
+        let base_str = base.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path")
+        })?;
+        match crate::chd_disk::ChdHd::open(base_str, cow) {
+            Ok(hd) => {
+                self.size = hd.size();
+                self.backend = Some(DiskBackend::ChdHd(hd));
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "SCSI: could not reopen {} after a COW operation: {} — the target now \
+                     reports no media",
+                    base.display(),
+                    e
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Reset the COW overlay — discard all uncommitted writes ("roll back"). For
@@ -326,11 +392,13 @@ impl ScsiDevice {
             };
             if let Some((base, diff, cow)) = info {
                 self.backend = None;
-                let _ = std::fs::remove_file(&diff); // discard every overlay write
-                let base_str = base.to_str()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
-                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
-                self.backend = Some(DiskBackend::ChdHd(reopened));
+                // Discard every overlay write. A failure here has to surface: a
+                // rollback that silently left the overlay in place would report
+                // success and then hand the guest back all the changes it just
+                // asked to throw away.
+                let discarded = crate::chd_disk::discard_overlay(&diff);
+                let reopened = self.reopen_chd(&base, cow);
+                return discarded.and(reopened);
             }
         }
         Ok(())
@@ -354,15 +422,55 @@ impl ScsiDevice {
         }
     }
 
-    /// Number of dirty sectors in the COW overlay (raw), or for a CHD a coarse
-    /// 1/0 "has uncommitted changes" (we don't track per-sector dirt there).
-    /// 0 if direct / no media.
+    /// Whether this device's disk state can be captured in a snapshot.
+    ///
+    /// A raw COW overlay can: it is a file plus a sector list, both of which
+    /// `cow_export`/`cow_import` round-trip. A CHD cannot yet — there is no
+    /// export for either overlay flavour, so saving one would write RAM while
+    /// leaving the disk to run on, and a later restore would rewind the machine
+    /// against a filesystem that had kept going. Callers check this *before*
+    /// stopping the machine and refuse the operation, rather than discovering it
+    /// half-way through and producing a snapshot that is quietly inconsistent.
+    pub fn snapshot_blocker(&self) -> Option<&'static str> {
+        #[cfg(feature = "chd")]
+        {
+            if matches!(self.backend, Some(DiskBackend::ChdHd(_))) {
+                return Some("CHD hard disks cannot be captured in a snapshot yet");
+            }
+        }
+        None
+    }
+
+    /// How much the COW overlay holds: dirty sectors for a raw overlay, owned
+    /// hunks for a sparse CHD overlay, or a coarse 1/0 for a parented CHD diff
+    /// (MAME gives us no per-hunk view of one). 0 if direct / no media.
+    ///
+    /// The unit differs per backend, so anything printing this should pair it
+    /// with [`Self::cow_extent_unit`] rather than assume sectors.
     pub fn cow_dirty_count(&self) -> usize {
         match &self.backend {
             Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
             #[cfg(feature = "chd")]
-            Some(DiskBackend::ChdHd(hd)) => usize::from(hd.diff_dirty()),
+            Some(DiskBackend::ChdHd(hd)) => hd.overlay_extent(),
             _ => 0,
+        }
+    }
+
+    /// What [`Self::cow_dirty_count`] counts for this backend.
+    pub fn cow_extent_unit(&self) -> &'static str {
+        match &self.backend {
+            Some(DiskBackend::Cow(_)) => "dirty sectors",
+            #[cfg(feature = "chd")]
+            Some(DiskBackend::ChdHd(hd)) => {
+                if hd.is_sparse_overlay() {
+                    "copied-up hunks"
+                } else {
+                    // A MAME diff is opaque to us: all we know is whether it
+                    // holds anything at all.
+                    "pending change sets"
+                }
+            }
+            _ => "dirty sectors",
         }
     }
 
@@ -579,6 +687,13 @@ impl ScsiDevice {
         if req.cdb.is_empty() {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Illegal Request: Invalid command
         }
+        // Every handler below reads at least the LUN byte, and the 10-byte
+        // commands read as far as byte 8. Refuse a CDB too short to decode
+        // instead of indexing past its end.
+        if cdb_too_short(&req.cdb) {
+            eprintln!("SCSI: truncated CDB ({} bytes) cdb={:02x?}", req.cdb.len(), &req.cdb);
+            return Ok(self.check_condition(0x05, 0x24, 0x00)); // Invalid field in CDB
+        }
 
         let lun = (req.cdb[1] >> 5) & 0x7;
 
@@ -626,8 +741,7 @@ impl ScsiDevice {
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            // No write-back cache to flush — our backend writes are already synchronous.
-            scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
+            scsi_cmd::SYNCHRONIZE_CACHE_10 => self.exec_synchronize_cache()?,
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
@@ -777,48 +891,92 @@ impl ScsiDevice {
     fn exec_write_6(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
         let lba = (((cdb[1] & 0x1F) as u64) << 16) | ((cdb[2] as u64) << 8) | (cdb[3] as u64);
         let count = if cdb[4] == 0 { 256 } else { cdb[4] as usize };
-        self.perform_write(lba, count, data_in)
+        self.perform_write(lba, count, data_in, false)
     }
 
     fn exec_write_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
         let lba = ((cdb[2] as u64) << 24) | ((cdb[3] as u64) << 16) | ((cdb[4] as u64) << 8) | (cdb[5] as u64);
         let count = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
-        self.perform_write(lba, count, data_in)
+        // FUA (byte 1 bit 3): the initiator wants this write on the medium
+        // before the command completes, not parked in a cache.
+        let fua = cdb[1] & 0x08 != 0;
+        self.perform_write(lba, count, data_in, fua)
     }
 
-    fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+    fn perform_write(
+        &mut self,
+        lba: u64,
+        count: usize,
+        data_in: Option<&Vec<u8>>,
+        fua: bool,
+    ) -> Result<ScsiResponse, std::io::Error> {
         if self.is_cdrom() {
-            return Ok(ScsiResponse {
-                status: 0x02, // Check Condition
-                data: vec![],
-            });
+            return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid command for a CD
+        }
+
+        // A zero-block transfer is legal and means "do nothing successfully".
+        // It arrives with no data-out phase at all, so checking the count before
+        // the data lets it through instead of failing it as a length mismatch.
+        if count == 0 {
+            return Ok(ScsiResponse { status: 0x00, data: vec![] });
         }
 
         let Some(data) = data_in else {
-            return Ok(ScsiResponse {
-                status: 0x02,
-                data: vec![],
-            });
+            return Ok(self.check_condition(0x05, 0x24, 0x00)); // Invalid field in CDB
         };
 
         let expected_len = count as u64 * self.logical_block_size;
         if data.len() as u64 != expected_len {
-            return Ok(ScsiResponse {
-                status: 0x02,
-                data: vec![],
-            });
+            return Ok(self.check_condition(0x05, 0x24, 0x00));
         }
 
-        // Writes always go through as 512-byte sectors (HDD path only, phys=logical=512)
+        // Bounds-check exactly as the read path does. Without this an
+        // out-of-range write extends a raw image past its capacity (and a COW
+        // overlay past its base), so the disk silently grows behind IRIX's back
+        // and the sectors beyond the advertised capacity are unreachable again
+        // after the next READ CAPACITY.
+        let sector_count = self.size / self.logical_block_size;
+        let end = lba.saturating_add(count as u64);
+        if lba >= sector_count || end > sector_count {
+            return Ok(self.check_condition(0x05, 0x21, 0x00)); // LBA Out of Range
+        }
+
         let Some(backend) = self.backend.as_mut() else {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         };
-        backend.write_sectors(lba, data)?;
+        if let Err(e) = backend.write_sectors(lba, data) {
+            eprintln!("SCSI WRITE lba={} count={} failed: {}", lba, count, e);
+            // MEDIUM ERROR / write fault, rather than propagating an Err that
+            // the controller would turn into a bare CHECK CONDITION with no sense.
+            return Ok(self.check_condition(0x03, 0x03, 0x00));
+        }
+        if fua {
+            if let Err(e) = backend.flush() {
+                eprintln!("SCSI WRITE(10) FUA flush failed: {}", e);
+                return Ok(self.check_condition(0x04, 0x00, 0x00)); // Hardware error
+            }
+        }
 
         Ok(ScsiResponse {
             status: 0x00,
             data: vec![],
         })
+    }
+
+    /// Flush the backend for SYNCHRONIZE CACHE. A device that advertises a
+    /// write-back cache in MODE SENSE page 8 has to honour the command that
+    /// empties it.
+    fn exec_synchronize_cache(&mut self) -> Result<ScsiResponse, std::io::Error> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(self.check_condition(0x02, 0x3A, 0x00)); // MEDIUM NOT PRESENT
+        };
+        match backend.flush() {
+            Ok(()) => Ok(ScsiResponse { status: 0x00, data: vec![] }),
+            Err(e) => {
+                eprintln!("SCSI SYNCHRONIZE CACHE failed: {}", e);
+                Ok(self.check_condition(0x04, 0x00, 0x00)) // Hardware error
+            }
+        }
     }
 
     fn exec_start_stop_unit(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
@@ -1314,5 +1472,229 @@ impl ScsiDevice {
         let dlen = (data.len() as u32) - 4;
         data[0..4].copy_from_slice(&dlen.to_be_bytes());
         Ok(ScsiResponse { status: 0x00, data })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "iris-scsi-{}-{}-{}.img",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// A raw-file HDD of `sectors` 512-byte blocks, filled with `fill`.
+    fn raw_disk(tag: &str, sectors: u64, fill: u8) -> (ScsiDevice, std::path::PathBuf) {
+        let path = unique_tmp(tag);
+        let size = sectors * 512;
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&vec![fill; size as usize]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let dev = ScsiDevice::new(
+            DiskBackend::Direct(f),
+            size,
+            false,
+            path.display().to_string(),
+            vec![],
+        );
+        (dev, path)
+    }
+
+    fn req(cdb: Vec<u8>, data_in: Option<Vec<u8>>) -> ScsiRequest {
+        ScsiRequest { cdb, data_len: ScsiDataLength::Unlimited, data_in }
+    }
+
+    fn write10(lba: u32, blocks: u16, fua: bool) -> Vec<u8> {
+        let l = lba.to_be_bytes();
+        let b = blocks.to_be_bytes();
+        vec![
+            scsi_cmd::WRITE_10,
+            if fua { 0x08 } else { 0x00 },
+            l[0], l[1], l[2], l[3],
+            0x00,
+            b[0], b[1],
+            0x00,
+        ]
+    }
+
+    fn read10(lba: u32, blocks: u16) -> Vec<u8> {
+        let l = lba.to_be_bytes();
+        let b = blocks.to_be_bytes();
+        vec![scsi_cmd::READ_10, 0, l[0], l[1], l[2], l[3], 0, b[0], b[1], 0]
+    }
+
+    /// A write past the advertised capacity must be refused with LBA OUT OF
+    /// RANGE, not silently extend the image behind IRIX's back.
+    #[test]
+    fn out_of_range_write_is_refused_and_does_not_grow_the_image() {
+        let (mut dev, path) = raw_disk("oor", 64, 0xAA);
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let r = dev.request(&req(write10(64, 1, false), Some(vec![0x5A; 512]))).unwrap();
+        assert_eq!(r.status, 0x02, "first LBA past the end must fail");
+        assert_eq!(dev.pending_sense[2] & 0x0f, 0x05, "ILLEGAL REQUEST");
+        assert_eq!(dev.pending_sense[12], 0x21, "LBA OUT OF RANGE");
+
+        // Straddling the end: 63 is valid, 64 is not — the whole command fails.
+        let r = dev.request(&req(write10(63, 2, false), Some(vec![0x5A; 1024]))).unwrap();
+        assert_eq!(r.status, 0x02, "a straddling write must fail");
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before,
+            "a rejected write must not extend the disk"
+        );
+        // And the in-range half of the straddling write must not have landed.
+        let r = dev.request(&req(read10(63, 1), None)).unwrap();
+        assert_eq!(r.status, 0x00);
+        assert_eq!(r.data, vec![0xAA; 512], "partial write leaked through");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A zero-block WRITE(10) is legal and means "nothing to do, successfully".
+    /// It arrives with no data-out phase, so it must not be failed as a length
+    /// mismatch.
+    #[test]
+    fn zero_block_write_succeeds() {
+        let (mut dev, path) = raw_disk("zero", 64, 0xAA);
+        let r = dev.request(&req(write10(4, 0, false), None)).unwrap();
+        assert_eq!(r.status, 0x00, "a zero-block write reports GOOD");
+        let r = dev.request(&req(read10(4, 1), None)).unwrap();
+        assert_eq!(r.data, vec![0xAA; 512], "and changes nothing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An in-range write still works, and FUA drives a flush rather than being
+    /// ignored.
+    #[test]
+    fn in_range_write_lands_and_fua_is_honoured() {
+        let (mut dev, path) = raw_disk("ok", 64, 0xAA);
+        let r = dev.request(&req(write10(4, 2, true), Some(vec![0x5A; 1024]))).unwrap();
+        assert_eq!(r.status, 0x00, "FUA write succeeded");
+        let r = dev.request(&req(read10(4, 2), None)).unwrap();
+        assert_eq!(r.data, vec![0x5A; 1024]);
+        // The bytes are on the medium, not just in our handle.
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(&on_disk[4 * 512..6 * 512], &vec![0x5A; 1024][..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SYNCHRONIZE CACHE has to actually flush: MODE SENSE page 8 advertises a
+    /// write-back cache, so returning GOOD without flushing is a lie IRIX acts on.
+    #[test]
+    fn synchronize_cache_flushes_and_reports_status() {
+        let (mut dev, path) = raw_disk("sync", 64, 0xAA);
+        dev.request(&req(write10(1, 1, false), Some(vec![0x33; 512]))).unwrap();
+        let r = dev
+            .request(&req(vec![scsi_cmd::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], None))
+            .unwrap();
+        assert_eq!(r.status, 0x00);
+        assert_eq!(&std::fs::read(&path).unwrap()[512..1024], &vec![0x33; 512][..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A CDB shorter than the command it names must produce CHECK CONDITION.
+    /// Before this the decoders indexed straight past the end, so a guest that
+    /// armed a one-byte transfer took the emulator's host process down with it.
+    #[test]
+    fn truncated_cdbs_are_rejected_not_panics() {
+        let (mut dev, path) = raw_disk("short", 64, 0xAA);
+        // Every opcode the dispatcher decodes, at every length below its own.
+        let opcodes = [
+            scsi_cmd::TEST_UNIT_READY, scsi_cmd::REQUEST_SENSE, scsi_cmd::READ_6,
+            scsi_cmd::WRITE_6, scsi_cmd::INQUIRY, scsi_cmd::MODE_SELECT_6,
+            scsi_cmd::MODE_SENSE_6, scsi_cmd::START_STOP_UNIT, scsi_cmd::SEND_DIAGNOSTIC,
+            scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL, scsi_cmd::READ_CAPACITY_10,
+            scsi_cmd::READ_10, scsi_cmd::WRITE_10, scsi_cmd::SYNCHRONIZE_CACHE_10,
+            scsi_cmd::MODE_SENSE_10, scsi_cmd::WRITE_BUFFER, scsi_cmd::READ_BUFFER,
+            scsi_cmd::READ_TOC_PMA_ATIP, scsi_cmd::GET_CONFIGURATION,
+            scsi_cmd::SGI_EJECT, scsi_cmd::SGI_HD2CDROM, 0xff,
+        ];
+        for op in opcodes {
+            let full = get_cdb_length(op).min(MIN_DECODED_CDB);
+            for len in 1..full {
+                let mut cdb = vec![0u8; len];
+                cdb[0] = op;
+                let r = dev.request(&req(cdb, None)).unwrap();
+                assert_eq!(
+                    r.status, 0x02,
+                    "opcode {op:02x} at {len} bytes should be CHECK CONDITION"
+                );
+            }
+        }
+        // An empty CDB too.
+        assert_eq!(dev.request(&req(vec![], None)).unwrap().status, 0x02);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A full-length CDB for every implemented opcode must be decodable — the
+    /// other half of the length guard, so it cannot be tightened past what the
+    /// commands legitimately need.
+    #[test]
+    fn full_length_cdbs_are_accepted() {
+        let (mut dev, path) = raw_disk("full", 64, 0xAA);
+        for op in [
+            scsi_cmd::TEST_UNIT_READY, scsi_cmd::REQUEST_SENSE, scsi_cmd::INQUIRY,
+            scsi_cmd::MODE_SENSE_6, scsi_cmd::READ_CAPACITY_10, scsi_cmd::READ_10,
+            scsi_cmd::SYNCHRONIZE_CACHE_10, scsi_cmd::MODE_SENSE_10, scsi_cmd::READ_BUFFER,
+            scsi_cmd::START_STOP_UNIT, scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL,
+        ] {
+            let mut cdb = vec![0u8; get_cdb_length(op)];
+            cdb[0] = op;
+            // Must not panic; status itself is command-specific.
+            let _ = dev.request(&req(cdb, None)).unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Reads are bounded the same way writes now are.
+    #[test]
+    fn out_of_range_read_is_refused() {
+        let (mut dev, path) = raw_disk("roor", 64, 0xAA);
+        let r = dev.request(&req(read10(64, 1), None)).unwrap();
+        assert_eq!(r.status, 0x02);
+        assert_eq!(dev.pending_sense[12], 0x21, "LBA OUT OF RANGE");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A raw COW overlay is snapshot-capable; the blocker only speaks up for the
+    /// backends whose disk state a snapshot cannot yet carry.
+    #[test]
+    fn raw_cow_has_no_snapshot_blocker() {
+        let base = unique_tmp("cowbase");
+        {
+            let mut f = File::create(&base).unwrap();
+            f.write_all(&vec![0xAAu8; 64 * 512]).unwrap();
+        }
+        let overlay = unique_tmp("cowovl");
+        let cow = crate::cow_disk::CowDisk::new(
+            base.to_str().unwrap(),
+            overlay.to_str().unwrap(),
+        )
+        .unwrap();
+        let dev = ScsiDevice::new(
+            DiskBackend::Cow(cow),
+            64 * 512,
+            false,
+            base.display().to_string(),
+            vec![],
+        );
+        assert!(dev.snapshot_blocker().is_none());
+        assert!(dev.is_cow());
+        drop(dev);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&overlay);
+        let _ = std::fs::remove_file(format!("{}.dirty", overlay.display()));
     }
 }

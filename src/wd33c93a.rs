@@ -676,6 +676,27 @@ impl Wd33c93a {
     /// Copy every COW overlay into `dir` as `scsi<id>.overlay`. Returns a
     /// list of `(id, dirty_sector_list)` entries so snapshot save can
     /// persist the dirty set alongside the raw overlay bytes.
+    /// Why this controller's disks cannot take part in a snapshot, if they
+    /// cannot: `(scsi id, reason)` for each target that blocks it.
+    ///
+    /// Asked *before* the machine is stopped. A backend whose disk state a
+    /// snapshot cannot carry has to abort the whole operation up front — saving
+    /// RAM while the disk keeps its own, later contents produces a snapshot that
+    /// restores a machine against a filesystem it never ran on, and nothing
+    /// about the result looks wrong until IRIX starts finding damage.
+    pub fn snapshot_blockers(&self) -> Vec<(usize, &'static str)> {
+        let state = self.state.lock();
+        let mut out = Vec::new();
+        for id in 0..8 {
+            if let Some(dev) = &state.devices[id] {
+                if let Some(why) = dev.snapshot_blocker() {
+                    out.push((id, why));
+                }
+            }
+        }
+        out
+    }
+
     pub fn export_overlays(&self, dir: &std::path::Path) -> std::io::Result<Vec<(usize, Vec<u64>)>> {
         let mut state = self.state.lock();
         let mut out = Vec::new();
@@ -1410,7 +1431,14 @@ impl Device for Wd33c93a {
                     for (id, dev) in state.devices.iter().enumerate() {
                         if let Some(d) = dev {
                             if d.is_cow() {
-                                writeln!(writer, "SCSI {}: COW overlay, {} dirty sectors", id, d.cow_dirty_count()).unwrap();
+                                writeln!(
+                                    writer,
+                                    "SCSI {}: COW overlay, {} {}",
+                                    id,
+                                    d.cow_dirty_count(),
+                                    d.cow_extent_unit()
+                                )
+                                .unwrap();
                             } else {
                                 writeln!(writer, "SCSI {}: direct (no overlay)", id).unwrap();
                             }
@@ -1977,17 +2005,27 @@ impl Wd33c93aState {
         // (cdb[1] bits 5-7) at 0. Fold target_lun in here so scsi.rs, which only looks
         // at cdb[1], sees the real LUN. If firmware/PROM ever does put a nonzero LUN
         // directly in the CDB, that takes precedence.
+        // Length first. A driver that arms a transfer count of one and issues
+        // TRANSFER_INFO hands us a one-byte "CDB", and everything below — the
+        // LUN fold, the trace formatting, scsi.rs's decoders — indexes further
+        // in than that. Reject it here instead of panicking on the way through.
         let mut cdb = cdb.to_vec();
-        if !cdb.is_empty() && (cdb[1] >> 5) & 0x7 == 0 && self.target_lun != 0 {
-            cdb[1] |= self.target_lun << 5;
-        }
-        let cdb = cdb.as_slice();
-        if cdb.is_empty() {
-            dlog!(self.log_module(), "WD33C93A({}): Empty CDB!", self.id);
+        if cdb.len() < scsi::get_cdb_length(cdb.first().copied().unwrap_or(0)).min(10) {
+            dlog!(
+                self.log_module(),
+                "WD33C93A({}): CDB too short ({} bytes): {:02x?}",
+                self.id,
+                cdb.len(),
+                &cdb
+            );
             self.update_asr(0, asr::LCI);
             self.queue_interrupt(Some(command_phase::DISCONNECTED), scsi_status::INVALID_COMMAND);
             return;
         }
+        if (cdb[1] >> 5) & 0x7 == 0 && self.target_lun != 0 {
+            cdb[1] |= self.target_lun << 5;
+        }
+        let cdb = cdb.as_slice();
 
         {
             let cmd_name = match cdb[0] {
@@ -2471,6 +2509,64 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Wd33c93a save_state mismatch after load_state round-trip");
+    }
+
+    /// Enabling COW on an **uncompressed** CHD must attach the target.
+    ///
+    /// This is the layer the failure showed up at: `add_device` returned `Err`,
+    /// so nothing was installed at that SCSI ID, the controller answered
+    /// SELECTION TIMEOUT, and IRIX reported no disk at all rather than a disk it
+    /// could not read. Reproducing it needs nothing more than an uncompressed
+    /// base and `overlay: true` — see `chd_disk`'s
+    /// `uncompressed_base_cannot_be_a_chd_parent` for why it failed.
+    #[test]
+    #[cfg(feature = "chd")]
+    fn cow_on_an_uncompressed_chd_attaches_the_target() {
+        use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
+        use std::io::Cursor;
+
+        let base = std::env::temp_dir().join(format!("iris_wd_cow_{}.chd", std::process::id()));
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&diff);
+        let logical = 1024 * 1024u64;
+        create_from_reader(
+            Cursor::new(vec![0xAAu8; logical as usize]),
+            &base,
+            HdCreateOptions {
+                logical_size: logical,
+                hunk_size: 4096,
+                unit_size: 512,
+                codecs: [0, 0, 0, 0], // uncompressed, as `chdman -c none` makes
+                geometry: None,
+                ident: None,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        let ctrl = make_scsi();
+        ctrl.add_device(1, base.to_str().unwrap(), false, vec![], true, None)
+            .expect("COW on an uncompressed CHD must attach");
+        {
+            let state = ctrl.state.lock();
+            assert!(state.devices[1].is_some(), "a target must exist at ID 1");
+            assert!(state.devices[1].as_ref().unwrap().is_cow(), "and it must be overlaid");
+        }
+        drop(ctrl);
+
+        // And the empty diff an older build left behind does not lock the disk
+        // out on the next launch, with COW off or on.
+        let ctrl2 = make_scsi();
+        ctrl2
+            .add_device(1, base.to_str().unwrap(), false, vec![], false, None)
+            .expect("the disk still attaches with COW off");
+        drop(ctrl2);
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&diff);
+        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base).with_extension("chd.apply"));
     }
 }
 #[cfg(test)]

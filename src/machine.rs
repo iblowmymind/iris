@@ -1669,8 +1669,44 @@ impl Machine {
         self.restart_peripherals();
     }
 
+    /// Whether any attached disk's state cannot be captured in (or restored
+    /// from) a snapshot, as a ready-to-print message.
+    ///
+    /// Checked before `stop()` in both directions, so a disk we cannot carry
+    /// aborts the operation with the machine still running rather than after it
+    /// has been halted — or, worse, after RAM has already been rewound.
+    fn snapshot_disk_blocker(&self) -> Option<String> {
+        let mut blockers: Vec<String> = self
+            .hpc3
+            .scsi()
+            .snapshot_blockers()
+            .into_iter()
+            .map(|(id, why)| format!("scsi0 id {id}: {why}"))
+            .collect();
+        if let Some(dev) = self.hpc3.scsi1() {
+            blockers.extend(
+                dev.snapshot_blockers()
+                    .into_iter()
+                    .map(|(id, why)| format!("scsi1 id {id}: {why}")),
+            );
+        }
+        if blockers.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "snapshots cannot include this machine's disk state ({}). Saving RAM without \
+             the disk would let a later restore rewind the machine against a filesystem \
+             that had kept running. Use a raw image with a COW overlay for snapshot work, \
+             or `cow commit` the CHD and snapshot a fresh session.",
+            blockers.join("; ")
+        ))
+    }
+
     /// Save full machine snapshot to `saves/<name>/`.
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
+        if let Some(why) = self.snapshot_disk_blocker() {
+            return Err(why);
+        }
         self.stop();
 
         let dir = std::path::PathBuf::from("saves").join(name);
@@ -1822,6 +1858,12 @@ impl Machine {
     /// pattern holds. The persistent JIT profile uses content_hash to skip
     /// stale entries (see `profile_stale` in dispatch.rs).
     fn load_snapshot_inner(&mut self, name: &str) -> Result<(), String> {
+        // Before anything is stopped or reset: a disk whose state the snapshot
+        // could not capture must not be restored *around*, or RAM rewinds while
+        // the filesystem stays where it got to.
+        if let Some(why) = self.snapshot_disk_blocker() {
+            return Err(why);
+        }
         self.stop();
 
         // Any prior in-memory rollback checkpoint is now stale (it described

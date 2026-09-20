@@ -72,6 +72,61 @@ is easiest to understand by reading the commit.
   PC/BD stores are emitted only when needed; the last instruction on a page and
   excluded instructions share one path (early September).
 
+### Storage
+
+- **Copy-on-write now works for CHD hard disks** (`src/chd_disk.rs`). It did not
+  before: MAME records a CHD's parent as the parent's SHA-1, chdman only computes
+  one while compressing, and so an uncompressed CHD cannot be a parent —
+  `HdImage::open_with_diff` failed on the reopen, *after* creating the diff, and
+  the leftover file made the disk refuse to open on every later launch, COW or
+  not. An uncompressed base now gets a **sparse overlay**: a parentless CHD of
+  the same geometry holding only the hunks the guest wrote, reading the rest from
+  the base, with a hunk copied up on its first write. The base is never opened
+  for writing while the overlay is attached. A compressed base keeps the
+  MAME-native parented diff. `cow commit` folds either kind (in place for a
+  sparse overlay, through the compressor for a diff), journalled with an `.apply`
+  marker so an interrupted commit is finished by the next open. An overlay for
+  the 240 GB disk from the original report is ~234 MB — the hunk map's own size —
+  rather than a copy of the base. The unusable diffs older builds left behind are
+  detected and cleared, once they are proven empty.
+  See `rules/scsi/chd-copy-on-write-overlays.md`.
+- **Storage integrity sweep** across the CHD, raw-COW, SCSI, snapshot and NFS
+  paths. The through-line was code reporting a durability or safety guarantee it
+  did not provide; `rules/snapshot/storage-durability-boundaries.md` records where
+  each boundary actually is.
+  - CHD: `flush` closes and reopens the file, because MAME holds the hunk map and
+    metadata index in memory until close and an `fsync` leaves the data present
+    but unreachable. Writes validate the whole range before touching anything and
+    mark the overlay dirty before the I/O. Folding a diff back preserves IDNT
+    (it was silently dropped) and refuses metadata it cannot reproduce; a read
+    error or short read in the merged source now aborts the fold instead of
+    zero-filling the replacement base. `cow commit`/`cow reset` can no longer
+    leave a target with no media.
+  - SCSI: SYNCHRONIZE CACHE flushes the backend and WRITE(10) honours FUA, both
+    of which were ignored while MODE SENSE page 8 advertised a write-back cache.
+    Out-of-range writes return CHECK CONDITION instead of extending the image; a
+    zero-block WRITE(10) returns GOOD; a CDB too short for its opcode returns
+    CHECK CONDITION instead of panicking the host process.
+  - Raw COW: commit writes to the configured base rather than one guessed by
+    stripping `.overlay` from the sidecar's name; a dirty list that disagrees with
+    its file, or names a sector past the disk, is rejected rather than read or
+    used to size an allocation; commit and reset persist the empty list before
+    truncating the overlay.
+  - Snapshots: a disk whose state cannot be captured aborts save *and* restore
+    before the machine is stopped, instead of writing RAM while the disk runs on
+    and letting a later restore rewind the machine against a filesystem it never
+    ran on. CHD disks are that case today. A restore whose overlay file is missing
+    but whose sector list is not is refused.
+  - Chunk store: BLAKE3 is verified on every read and on reuse, so a chunk that
+    never reached the platter cannot be adopted and loaded back as RAM;
+    concurrent puts no longer share a temp filename.
+  - NFS: a symlink sitting in the exported directory is no longer a way out of
+    it — only the final component was ever `lstat`ed, and every operation after
+    that followed the link. Renaming a directory carries its descendants' handles
+    with it, and a clobbered destination's handles are retired rather than left
+    aliasing the file that replaced them. WRITE answers `FILE_SYNC`, so it now
+    actually syncs.
+
 ### Networking
 
 - **Guest DNS goes to the host's DNS server** (`src/host_dns.rs`): the first IPv4
