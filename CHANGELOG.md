@@ -101,6 +101,26 @@ is easiest to understand by reading the commit.
   PC/BD stores are emitted only when needed; the last instruction on a page and
   excluded instructions share one path (early September).
 
+### Storage
+
+- **Copy-on-write works on uncompressed CHD hard disks.** Enabling COW on one
+  (e.g. `chdman createhd … -c none`) used to make the disk vanish: MAME records a
+  CHD's parent as the parent's SHA-1, chdman only computes one while compressing,
+  so the overlay could not be linked to an uncompressed base and `add_device`
+  failed — IRIX saw no target at that SCSI ID. The half-made `.diff.chd` it left
+  behind then kept the disk from attaching on every later launch, with COW off as
+  well. An uncompressed base now gets a **sparse overlay**: a parentless CHD of
+  the same geometry holding only the hunks the guest wrote, reading the rest from
+  the base, with a hunk copied up on its first write; the base is never opened
+  for writing while it is attached. `cow commit` writes the overlay's hunks back
+  in place, journalled so an interrupted commit is finished by the next open;
+  `cow reset` and the GUI's commit/roll back handle both overlay kinds. Leftover
+  diffs from older builds are cleared once proven empty. For a 240 GB disk the
+  overlay starts at ~242 MB — the hunk map every uncompressed CHD that size
+  carries, plus a presence bitmap — and grows only with what is written.
+  Compressed CHDs keep the MAME-native diff. See
+  `rules/scsi/chd-copy-on-write-overlays.md`.
+
 ### Networking
 
 - **Guest DNS goes to the host's DNS server** (`src/host_dns.rs`): the first IPv4

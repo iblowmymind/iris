@@ -498,13 +498,17 @@ fn worker_loop(
                     let diff = iris::chd_disk::diff_path_for(std::path::Path::new(&base));
                     if diff.exists() {
                         let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: 0.0 });
-                        match iris::chd_disk::flatten_diff(
+                        // `commit_overlay`, not `flatten_diff`: a COW disk over an
+                        // uncompressed base carries a sparse overlay, which has no
+                        // parent link and cannot be folded by rebuilding through
+                        // the compressor.
+                        match iris::chd_disk::commit_overlay(
                             std::path::Path::new(&base),
                             &diff,
                             &mut |f| { let _ = evt_tx.send(Evt::SyncProgress { disk: 0, total: 1, fraction: f }); },
                             &|| false,
                         ) {
-                            Ok(()) => { let _ = evt_tx.send(Evt::SyncDone(1)); }
+                            Ok(_) => { let _ = evt_tx.send(Evt::SyncDone(1)); }
                             Err(e) => {
                                 let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}")));
                                 let _ = evt_tx.send(Evt::SyncDone(0));
@@ -527,17 +531,23 @@ fn worker_loop(
             }
             Ok(Cmd::CowReset { base, chd }) => {
                 // Roll back: discard the overlay. File-level; stopped-only.
-                let target = if chd {
-                    iris::chd_disk::diff_path_for(std::path::Path::new(&base))
+                let outcome = if chd {
+                    // Takes a sparse overlay's bookkeeping (an interrupted
+                    // commit's marker, a part-made overlay) with it, so the next
+                    // open does not try to finish work that was just discarded.
+                    iris::chd_disk::discard_overlay(
+                        &iris::chd_disk::diff_path_for(std::path::Path::new(&base)),
+                    )
                 } else {
                     let _ = std::fs::remove_file(format!("{base}.overlay.dirty"));
-                    std::path::PathBuf::from(format!("{base}.overlay"))
-                };
-                match std::fs::remove_file(&target) {
-                    Ok(()) => { let _ = evt_tx.send(Evt::CowDone { committed: false }); }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let _ = evt_tx.send(Evt::CowDone { committed: false });
+                    match std::fs::remove_file(format!("{base}.overlay")) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e),
                     }
+                };
+                match outcome {
+                    Ok(()) => { let _ = evt_tx.send(Evt::CowDone { committed: false }); }
                     Err(e) => { let _ = evt_tx.send(Evt::Error(format!("roll back failed: {e}"))); }
                 }
             }

@@ -2472,6 +2472,62 @@ mod tests {
 
         assert_eq!(v1, v2, "Wd33c93a save_state mismatch after load_state round-trip");
     }
+
+    /// Enabling COW on an **uncompressed** CHD must attach the target.
+    ///
+    /// This is the layer the failure showed up at: `add_device` returned `Err`,
+    /// so nothing was installed at that SCSI ID, the controller answered
+    /// SELECTION TIMEOUT, and IRIX reported no disk at all rather than a disk it
+    /// could not read. Reproducing it needs nothing more than an uncompressed
+    /// base and `overlay: true` — see `chd_disk`'s
+    /// `uncompressed_base_cannot_be_a_chd_parent` for why it failed.
+    #[test]
+    #[cfg(feature = "chd")]
+    fn cow_on_an_uncompressed_chd_attaches_the_target() {
+        use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
+        use std::io::Cursor;
+
+        let base = std::env::temp_dir().join(format!("iris_wd_cow_{}.chd", std::process::id()));
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&diff);
+        let logical = 1024 * 1024u64;
+        create_from_reader(
+            Cursor::new(vec![0xAAu8; logical as usize]),
+            &base,
+            HdCreateOptions {
+                logical_size: logical,
+                hunk_size: 4096,
+                unit_size: 512,
+                codecs: [0, 0, 0, 0], // uncompressed, as `chdman -c none` makes
+                geometry: None,
+                ident: None,
+            },
+            &mut |_| {},
+            &|| false,
+        )
+        .unwrap();
+
+        let ctrl = make_scsi();
+        ctrl.add_device(1, base.to_str().unwrap(), false, vec![], true, None)
+            .expect("COW on an uncompressed CHD must attach");
+        {
+            let state = ctrl.state.lock();
+            assert!(state.devices[1].is_some(), "a target must exist at ID 1");
+            assert!(state.devices[1].as_ref().unwrap().is_cow(), "and it must be overlaid");
+        }
+        drop(ctrl);
+
+        // Turning COW back off must still attach, with the overlay left in place.
+        let ctrl2 = make_scsi();
+        ctrl2
+            .add_device(1, base.to_str().unwrap(), false, vec![], false, None)
+            .expect("the disk still attaches with COW off");
+        drop(ctrl2);
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&diff);
+    }
 }
 #[cfg(test)]
 mod pio_direction_tests {

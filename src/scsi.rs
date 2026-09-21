@@ -281,8 +281,9 @@ impl ScsiDevice {
     }
 
     /// Commit the COW overlay into the base image ("apply the changes"). For a
-    /// raw overlay this copies the dirty sectors in place; for a CHD it rebuilds
-    /// the base from the diff (recompressing) and reopens a fresh overlay. No-op
+    /// raw overlay this copies the dirty sectors in place; for a CHD it writes a
+    /// sparse overlay's hunks back in place, or rebuilds a compressed base from
+    /// its diff, and reopens a fresh overlay. No-op
     /// if not overlaid. Returns a coarse count of what was committed.
     pub fn cow_commit(&mut self) -> io::Result<usize> {
         if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
@@ -300,7 +301,10 @@ impl ScsiDevice {
             };
             if let Some((base, diff, cow)) = info {
                 self.backend = None;
-                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
+                // `commit_overlay`, not `flatten_diff`: a COW disk over an
+                // uncompressed base carries a sparse overlay, which has no parent
+                // link and cannot be folded by rebuilding through the compressor.
+                crate::chd_disk::commit_overlay(&base, &diff, &mut |_| {}, &|| false)?;
                 let base_str = base.to_str()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
                 let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
@@ -326,7 +330,14 @@ impl ScsiDevice {
             };
             if let Some((base, diff, cow)) = info {
                 self.backend = None;
-                let _ = std::fs::remove_file(&diff); // discard every overlay write
+                // Discard every overlay write, along with a sparse overlay's
+                // bookkeeping (an interrupted commit's marker), so the next open
+                // does not try to finish work that was just thrown away. A failure
+                // is logged rather than returned so the reopen below still runs
+                // and the target does not lose its media.
+                if let Err(e) = crate::chd_disk::discard_overlay(&diff) {
+                    eprintln!("SCSI: discarding {} failed: {}", diff.display(), e);
+                }
                 let base_str = base.to_str()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
                 let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
