@@ -82,6 +82,13 @@ hostgl = ["hostcall", "iris/hostgl"]
 # gains Start/Stop for a .pftrace to open at ui.perfetto.dev.
 # Build with: cargo build -p iris-gui --features perfetto
 perfetto = ["iris/perfetto"]
+# Native macOS front-end: menus in the system menu bar, dialogs and the
+# configuration editor in their own OS windows, and the run state in the window
+# title, so the main window holds only the emulated display. An alternative to
+# the default in-window sidebar, not a replacement; off by default. Ignored on
+# other platforms, which always use the sidebar. See src/macos_native/.
+# Build with: cargo build -p iris-gui --features macos-gui
+macos-gui = ["dep:objc2-app-kit"]
 
 [dependencies]
 # The GUI always enables the graphics JITs (`gpujit`: REX3 draw shaders and
@@ -128,6 +135,11 @@ sys-locale = "0.3"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSURL", "NSData", "NSError", "NSString", "NSArray", "NSPathUtilities",
+] }
+# AppKit menu bar and window tabbing for the `macos-gui` front-end only.
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder",
+    "NSWindow",
 ] }
 
 [[bin]]
