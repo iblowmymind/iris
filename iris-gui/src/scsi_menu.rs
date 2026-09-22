@@ -119,7 +119,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
     action
 }
 
-fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
+pub(crate) fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
     match dev {
         None => t!("scsi-slot-empty", id = id),
         Some(d) if d.is_daynaport() => t!("scsi-slot-daynaport", id = id),
@@ -160,7 +160,7 @@ fn dialog_at(title: &str, cur: &str) -> rfd::FileDialog {
                               crate::filedialog::Purpose::Open)
 }
 
-fn pick_disk(title: &str, cur: &str) -> Option<String> {
+pub(crate) fn pick_disk(title: &str, cur: &str) -> Option<String> {
     dialog_at(title, cur)
         .add_filter(t!("scsi-filter-disk"), &["raw", "img", "chd"])
         .add_filter(t!("scsi-filter-all"), &["*"])
