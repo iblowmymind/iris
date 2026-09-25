@@ -74,9 +74,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned quick-sharun + appimagetool versions (same as rusty-backup).
-  ANYLINUX_REF: 2affcd69e3b3fccab4507dbdbaed5d1a04bedfa9
-  APPIMAGETOOL_VERSION: "0.3.0"
+  # quick-sharun + get-debloated-pkgs come from Anylinux-AppImages, tracking
+  # main rather than a pinned commit. Upstream moved anylinux.c out to its own
+  # repo (Anylinux-sharun) on 2026-09-10, and the commit we used to pin here
+  # still fetched it from the old refs/heads/main path -- which 404s, so the
+  # script's five silent retries could never succeed ("Failed to download 5
+  # times!"). Current quick-sharun does not build the helper libs at all: it
+  # pulls them prebuilt from an Anylinux-sharun release, and sha256-pins that
+  # tarball (and appimagetool) inside the script itself, so tracking main keeps
+  # the script and everything it downloads in step. Set this to a commit SHA if
+  # a future upstream change ever needs to be held back.
+  ANYLINUX_REF: refs/heads/main
 
 jobs:
   # ── Version ──────────────────────────────────────────────────────────────────
@@ -536,11 +544,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x64
-            sharun_arch: x86_64
             runs-on: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             arch: arm64
-            sharun_arch: aarch64
             runs-on: ubuntu-24.04-arm
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
@@ -618,7 +624,13 @@ jobs:
           export VERSION="${VER}"
           export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
           export DESKTOP=/usr/share/applications/iris-gui.desktop
-          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          # appimagetool is deliberately NOT overridden here: quick-sharun
+          # sha256-checks it against the version it ships with, so pointing
+          # APPIMAGETOOL_LINK elsewhere fails that check. Same for the sharun
+          # helper-libs tarball (which is where anylinux.so now comes from).
+          # OUTNAME/VERSION/OUTPATH are still read by appimagetool, so the
+          # artifact name below is unchanged. GITHUB_REPOSITORY is set by
+          # Actions; appimagetool auto-emits the .zsync from it.
           mkdir -p "$OUTPATH"
           ./quick-sharun /usr/bin/iris-gui
           ./quick-sharun --make-appimage
