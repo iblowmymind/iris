@@ -170,7 +170,7 @@ impl App {
             ui.set_max_width(380.0);
             ui.heading("IRIS");
             ui.label("SGI Indy (MIPS R4400) emulator");
-            ui.label(format!("Version {}", env!("APP_VERSION")));
+            ui.label(format!("Version {} ({})", env!("APP_VERSION"), env!("APP_COMMIT")));
             ui.add_space(8.0);
             ui.label(RichText::new("Authors").strong());
             ui.label("IRIS: Dominik Behr (techomancer) and contributors");
