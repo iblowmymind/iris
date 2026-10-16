@@ -184,12 +184,15 @@ impl App {
             // — nothing left to report, same as the default layout's
             // build_features_grid.
             //
-            // rex-jit is a compile-time feature, but the App Store build forces
-            // the interpreter at runtime via IRIS_NO_JIT. Report what is
-            // actually running.
+            // The JITs are compile-time features, but the App Store build
+            // forces the interpreter at runtime via IRIS_NO_JIT. Report what
+            // is actually running.
             let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
-            let jit = if !bf::REX_JIT { "off" } else if jit_off { "off (sandbox)" } else { "on" };
-            ui.label(format!("  rex-jit:   {jit}"));
+            let jit_state = |feat: bool| if !feat { "off" } else if jit_off { "off (sandbox)" } else { "on" };
+            ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
+            ui.label(format!("  gr2-jit:   {}", jit_state(bf::GR2_JIT)));
+            ui.label(format!("  gr4-jit:   {}", jit_state(bf::GR4_JIT)));
+            ui.label(format!("  jitv2:     {}", jit_state(bf::JITV2)));
             ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
             ui.label(format!("  hostcall:  {}", on(bf::HOSTCALL)));
             ui.label(format!("  hostgl:    {}", on(bf::HOSTGL)));
@@ -204,7 +207,22 @@ impl App {
         use iris::config::NetMode;
         let mut parts: Vec<String> = Vec::new();
         let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
-        parts.push(format!("{name}{}", if self.cfg_dirty { " *" } else { "" }));
+        let profile = self.cfg.machine.profile.label();
+        // While running, name the CPU the guest actually booted on — the
+        // config may already have been changed to one that only takes effect
+        // next Start (see the default layout's status_block).
+        let running_cpu = if self.emu.is_running() { self.started_cpu } else { None };
+        let cpu = running_cpu.unwrap_or(self.cfg.machine.cpu);
+        parts.push(format!(
+            "{name} \u{00b7} {profile} \u{00b7} {}{}",
+            cpu.label(),
+            if self.cfg_dirty { " *" } else { "" }
+        ));
+        if let Some(started) = running_cpu {
+            if started != self.cfg.machine.cpu {
+                parts.push(format!("{} pending (Stop to apply)", self.cfg.machine.cpu.label()));
+            }
+        }
 
         let running = self.emu.is_running();
         let halted = running && self.emu.status.cpu_halted;
@@ -252,6 +270,9 @@ impl App {
                 let filtered = if self.fb_nearest { "" } else { " filtered" };
                 parts.push(format!("{}{filtered}", menus::scale_label(self.fb_scale)));
             }
+        }
+        if running && self.emu.status.dirty_cow > 0 {
+            parts.push(format!("dirty COW: {}", self.emu.status.dirty_cow));
         }
         if self.input_state.captured {
             parts.push(format!("captured \u{2014} {} to release", input::RELEASE_HINT));
