@@ -291,6 +291,10 @@ impl App {
                 Some(started) => cpus.push(Item::Info(format!("Running: {}", started.label()))),
                 None => {}
             }
+            // Matches the default layout's menu_list Machine-menu hint — the
+            // radio items above are disabled while running for the same
+            // reason.
+            cpus.push(Item::Info("CPU changes apply after Stop \u{2192} Start".into()));
         }
         items.push(Item::Sub {
             label: format!("Processor: {}", self.cfg.machine.cpu.label()),
@@ -324,6 +328,13 @@ impl App {
             .enabled_if(running)
             .accel('k'),
         );
+        if running && self.input_state.captured {
+            // The chord only does anything while captured (input.rs returns
+            // early on the uncaptured path before it sets f11_to_guest), and
+            // the default layout's capture_controls only shows this line in
+            // the same state — surface it here too.
+            items.push(Item::Info("Send F11 to IRIX: Ctrl+Alt+F11".into()));
+        }
         Menu { title: "Machine".into(), items }
     }
 
@@ -518,11 +529,16 @@ impl App {
 
     fn help_menu(&self) -> Menu {
         let running = self.emu.is_running();
+        // The diagnostic tests the guest IP against the NAT subnet, so it
+        // doesn't apply in PCAP mode — matches the default layout's "check"
+        // button (main.rs's nat_running gate).
+        let nat_running = running
+            && matches!(self.launched_net.as_ref(), Some((iris::config::NetMode::Nat, _)));
         let mut items = vec![
             Item::Info("Diagnostics".into()),
             act("Test camera\u{2026}", Action::CameraTest).enabled_if(running),
             act("Serial console\u{2026}", Action::SerialConsole).enabled_if(running),
-            act("Check networking\u{2026}", Action::NetCheck).enabled_if(running),
+            act("Check networking\u{2026}", Action::NetCheck).enabled_if(nat_running),
             Item::Separator,
             act("How camera & networking work\u{2026}", Action::HelpInfo),
             act("Mount the shared folder in IRIX\u{2026}", Action::NfsHelp),
