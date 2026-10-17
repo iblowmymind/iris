@@ -112,6 +112,13 @@ env_logger = "0.11"
 # and it does not trigger the macOS 15 Local Network prompt (that's for talking
 # *to* LAN peers, not enumerating your own NICs).
 if-addrs = "0.15"
+# GUI text catalogs (locales/<language>/*.ftl, see src/i18n.rs). Fluent handles
+# plurals and argument formatting per language; sys-locale picks the system
+# language when the user hasn't chosen one.
+fluent-bundle = "0.16"
+fluent-syntax = "0.12"
+unic-langid = "0.9"
+sys-locale = "0.3"
 
 # macOS App Sandbox: NSURL security-scoped bookmarks let the App Store build
 # reopen user-selected disk images / PROMs / ISOs across launches. These crates
