@@ -109,23 +109,23 @@ pub fn rebuild(menus: &[Menu]) {
     let app_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
     app_menu.setAutoenablesItems(false);
-    add_item(&app_menu, mtm, &target, &mut actions, "About IRIS", Some(Action::About), true, false, None);
+    add_item(&app_menu, mtm, &target, &mut actions, &t!("macos-app-about"), Some(Action::About), true, false, None);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     let services = NSMenu::new(mtm);
-    let services_item = plain_item(mtm, "Services");
+    let services_item = plain_item(mtm, &t!("macos-app-services"));
     services_item.setSubmenu(Some(&services));
     app_menu.addItem(&services_item);
     app.setServicesMenu(Some(&services));
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Standard responder-chain actions: target `nil` sends them up to NSApp.
-    system_item(&app_menu, mtm, "Hide IRIS", sel!(hide:), Some(("h", false)));
-    system_item(&app_menu, mtm, "Hide Others", sel!(hideOtherApplications:), None);
-    system_item(&app_menu, mtm, "Show All", sel!(unhideAllApplications:), None);
+    system_item(&app_menu, mtm, &t!("macos-app-hide"), sel!(hide:), Some(("h", false)));
+    system_item(&app_menu, mtm, &t!("macos-app-hide-others"), sel!(hideOtherApplications:), None);
+    system_item(&app_menu, mtm, &t!("macos-app-show-all"), sel!(unhideAllApplications:), None);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Our own Quit rather than `terminate:`, so quitting through the menu goes
     // through the app's close handling (which folds pending CHD changes back
     // into their disks) instead of tearing the process down underneath it.
-    add_item(&app_menu, mtm, &target, &mut actions, "Quit IRIS", Some(Action::Quit), true, false, Some(("q", false)));
+    add_item(&app_menu, mtm, &target, &mut actions, &t!("macos-app-quit"), Some(Action::Quit), true, false, Some(("q", false)));
     app_item.setSubmenu(Some(&app_menu));
     bar.addItem(&app_item);
 

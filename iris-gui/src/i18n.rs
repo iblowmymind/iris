@@ -179,8 +179,15 @@ pub fn set_language(preference: &str) {
 }
 
 /// Installed languages as `(code, name)`, where the name is the catalog's own
-/// `language-name` (so each language is listed in itself).
+/// `language-name` (so each language is listed in itself). The catalogs are
+/// compiled in, so the list is built once: the native menu bar asks for it on
+/// every rebuild, and building it parses every catalog.
 pub fn languages() -> Vec<(&'static str, String)> {
+    static LIST: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
+    LIST.get_or_init(build_language_list).clone()
+}
+
+fn build_language_list() -> Vec<(&'static str, String)> {
     LOCALES
         .iter()
         .map(|(code, _)| {

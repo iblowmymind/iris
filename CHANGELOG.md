@@ -654,6 +654,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   windows, and the run state in the window title, so the main window holds only
   the display. Off by default and ignored off macOS; the default layout is
   unchanged. See `rules/gui/macos-gui-front-end.md`.
+  Its menus, windows and title use the GUI text catalogs, with View → Language;
+  text only it shows is in `locales/en/macos.ftl`.
 - **2026-09-30 — UI consistency** (`e38f38a`): shared graphics board picker,
   memory controls, and processor clock controls across machine setup paths.
   Kernel tick rate appears next to MIPS; mouse injection is available from

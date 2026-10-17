@@ -145,12 +145,15 @@ cargo run -p iris-gui --release --features macos-gui
   panel while stopped). Save and restore state use fixed slots (snap1–4),
   since a menu has nowhere to type a name. Help → About IRIS lists the build
   features.
-- **File → Configuration…** (⌘,) opens the configuration editor in a
+- **File → Settings…** (⌘,) opens the configuration editor in a
   **separate window**. Every dialog is also its own window, so none of them
   ever covers the picture.
 - The **window title** carries the status footer: machine name, run state,
   MIPS, networking, on-screen scale, capture state and the latest
   notification.
+- **View → Language** picks the GUI language, as in the default layout.
+  Menu, window and title text comes from the same catalogs
+  (`locales/<language>/`); text only this layout shows is in `macos.ftl`.
 - Extra shortcuts: ⌘R / ⇧⌘R start / stop, ⌘K capture, ⌘F fullscreen, ⌘N new
   machine, ⌘Q quit (through the same close handling as closing the window, so
   pending CHD changes are still folded back).
