@@ -48,6 +48,14 @@ retry() {
     done
 }
 
+# gh prints an API error's JSON body on stdout, so `$(gh api ...) || true`
+# captures it as if it were the answer. Print the result only on success.
+gh_try() {
+    local out
+    out=$(gh api "$@" 2>/dev/null) || return 1
+    printf '%s' "$out"
+}
+
 # ── Clear out drafts a failed run left behind ────────────────────────────────
 gh api --paginate "repos/$R/releases?per_page=100" \
     --jq ".[] | select(.draft and .name == \"$STAGING\") | .id" |
@@ -59,10 +67,10 @@ done
 # ── Notes ────────────────────────────────────────────────────────────────────
 BODY=$(cat "$NOTES")
 OLD_SHA=""
-[ -z "$PREVIOUS" ] || OLD_SHA=$(gh api "repos/$R/commits/$PREVIOUS" --jq .sha 2>/dev/null || true)
+[ -z "$PREVIOUS" ] || OLD_SHA=$(gh_try "repos/$R/commits/$PREVIOUS" --jq .sha || true)
 if [ -n "$PREVIOUS" ]; then
     if [ -n "$OLD_SHA" ] && [ "$OLD_SHA" != "$SHA" ]; then
-        CHANGES=$(gh api "repos/$R/compare/$OLD_SHA...$SHA" \
+        CHANGES=$(gh_try "repos/$R/compare/$OLD_SHA...$SHA" \
             --jq '.commits | reverse | .[:50][] | "- \(.commit.message | split("\n")[0]) (\(.sha[:8]))"' || true)
         if [ -n "$CHANGES" ]; then
             BODY="$BODY
@@ -75,7 +83,7 @@ $CHANGES
         fi
     fi
 elif [ "$MOVE_TAG" = 0 ]; then
-    GENERATED=$(gh api -X POST "repos/$R/releases/generate-notes" -f tag_name="$TAG" --jq .body || true)
+    GENERATED=$(gh_try -X POST "repos/$R/releases/generate-notes" -f tag_name="$TAG" --jq .body || true)
     [ -n "$GENERATED" ] && BODY="$BODY
 
 $GENERATED"
@@ -106,7 +114,7 @@ done
 [ "$count" -gt 0 ] || die "nothing to upload in $DIR"
 
 # ── Swap ─────────────────────────────────────────────────────────────────────
-OLD=$(gh api "repos/$R/releases/tags/$TAG" --jq .id 2>/dev/null || true)
+OLD=$(gh_try "repos/$R/releases/tags/$TAG" --jq .id || true)
 if [ -n "$OLD" ]; then
     log "deleting the previous $TAG release ($OLD)"
     gh api -X DELETE "repos/$R/releases/$OLD"
