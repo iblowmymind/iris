@@ -147,9 +147,10 @@ impl App {
         if !self.show_config_editor {
             return;
         }
-        let machine = self.prefs.active_machine.as_deref().unwrap_or("default").to_string();
+        let machine =
+            self.prefs.active_machine.clone().unwrap_or_else(|| t!("main-settings-no-machine"));
         let mut open = true;
-        window::Window::new(format!("IRIS configuration \u{2014} {machine}"))
+        window::Window::new(t!("main-settings-heading", name = &machine))
             .open(&mut open)
             .resizable(true)
             .default_width(620.0)
@@ -166,19 +167,19 @@ impl App {
     /// (The default layout lists this at the bottom of its Help menu.)
     fn about_window(&mut self, ctx: &e::Context) {
         let mut open = self.native.show_about;
-        window::Window::new("About IRIS").open(&mut open).resizable(false).show(ctx, |ui| {
+        window::Window::new(t!("macos-app-about")).open(&mut open).resizable(false).show(ctx, |ui| {
             ui.set_max_width(380.0);
             ui.heading("IRIS");
-            ui.label("SGI Indy (MIPS R4400) emulator");
-            ui.label(format!("Version {} ({})", env!("APP_VERSION"), env!("APP_COMMIT")));
+            ui.label(t!("menu-help-title"));
+            ui.label(t!("menu-help-version", version = env!("APP_VERSION"), commit = env!("APP_COMMIT")));
             ui.add_space(8.0);
-            ui.label(RichText::new("Authors").strong());
-            ui.label("IRIS: Dominik Behr (techomancer) and contributors");
-            ui.label("iris-gui contributor: Dani Sarfati (danifunker)");
+            ui.label(RichText::new(t!("menu-help-authors")).strong());
+            ui.label(t!("menu-help-authors-iris"));
+            ui.label(t!("menu-help-authors-gui"));
             ui.add_space(8.0);
-            ui.label(RichText::new("Build features").strong());
+            ui.label(RichText::new(t!("menu-help-build-features")).strong());
             use iris::build_features as bf;
-            let on = |b: bool| if b { "on" } else { "off" };
+            let on = |b: bool| if b { t!("menu-help-feature-on") } else { t!("menu-help-feature-off") };
             // chd/camera/ultra64/ip28 used to be listed here too, but they're
             // always compiled in now (see the "feature flag cleanups" commit)
             // — nothing left to report, same as the default layout's
@@ -188,14 +189,27 @@ impl App {
             // forces the interpreter at runtime via IRIS_NO_JIT. Report what
             // is actually running.
             let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
-            let jit_state = |feat: bool| if !feat { "off" } else if jit_off { "off (sandbox)" } else { "on" };
-            ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
-            ui.label(format!("  gr2-jit:   {}", jit_state(bf::GR2_JIT)));
-            ui.label(format!("  gr4-jit:   {}", jit_state(bf::GR4_JIT)));
-            ui.label(format!("  jitv2:     {}", jit_state(bf::JITV2)));
-            ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
-            ui.label(format!("  hostcall:  {}", on(bf::HOSTCALL)));
-            ui.label(format!("  hostgl:    {}", on(bf::HOSTGL)));
+            let jit_state = |feat: bool| {
+                if !feat {
+                    t!("menu-help-feature-off")
+                } else if jit_off {
+                    t!("menu-help-feature-off-sandbox")
+                } else {
+                    t!("menu-help-feature-on")
+                }
+            };
+            let lightning = if bf::LIGHTNING {
+                t!("menu-help-feature-on-no-debug")
+            } else {
+                t!("menu-help-feature-off")
+            };
+            ui.label(t!("menu-help-feature", name = "rex-jit", state = jit_state(bf::REX_JIT)));
+            ui.label(t!("menu-help-feature", name = "gr2-jit", state = jit_state(bf::GR2_JIT)));
+            ui.label(t!("menu-help-feature", name = "gr4-jit", state = jit_state(bf::GR4_JIT)));
+            ui.label(t!("menu-help-feature", name = "jitv2", state = jit_state(bf::JITV2)));
+            ui.label(t!("menu-help-feature", name = "lightning", state = lightning));
+            ui.label(t!("menu-help-feature", name = "hostcall", state = on(bf::HOSTCALL)));
+            ui.label(t!("menu-help-feature", name = "hostgl", state = on(bf::HOSTGL)));
         });
         self.native.show_about = open;
     }
@@ -206,83 +220,87 @@ impl App {
     fn window_title(&self) -> String {
         use iris::config::NetMode;
         let mut parts: Vec<String> = Vec::new();
-        let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
+        let name = self.prefs.active_machine.clone().unwrap_or_else(|| t!("welcome-unsaved"));
         let profile = self.cfg.machine.profile.label();
         // While running, name the CPU the guest actually booted on — the
         // config may already have been changed to one that only takes effect
         // next Start (see the default layout's status_block).
         let running_cpu = if self.emu.is_running() { self.started_cpu } else { None };
         let cpu = running_cpu.unwrap_or(self.cfg.machine.cpu);
-        parts.push(format!(
-            "{name} \u{00b7} {profile} \u{00b7} {}{}",
-            cpu.label(),
-            if self.cfg_dirty { " *" } else { "" }
-        ));
+        parts.push(if self.cfg_dirty {
+            t!("status-machine-unsaved", name = &name, profile = profile, cpu = cpu.label())
+        } else {
+            t!("status-machine", name = &name, profile = profile, cpu = cpu.label())
+        });
         if let Some(started) = running_cpu {
             if started != self.cfg.machine.cpu {
-                parts.push(format!("{} pending (Stop to apply)", self.cfg.machine.cpu.label()));
+                parts.push(t!("status-cpu-pending", cpu = self.cfg.machine.cpu.label()));
             }
         }
 
         let running = self.emu.is_running();
         let halted = running && self.emu.status.cpu_halted;
-        parts.push(
-            if running && self.emu.status.cpu_stopped {
-                "powered off"
-            } else if halted {
-                "halted \u{2014} safe to stop"
-            } else if self.emu.status.in_prom {
-                "PROM"
-            } else if running {
-                "IRIX running"
-            } else {
-                "stopped"
-            }
-            .to_string(),
-        );
+        parts.push(if running && self.emu.status.cpu_stopped {
+            t!("macos-status-powered-off")
+        } else if halted {
+            t!("status-halted")
+        } else if self.emu.status.in_prom {
+            t!("status-prom")
+        } else if running {
+            t!("status-running")
+        } else {
+            t!("status-stopped")
+        });
         if running && !halted {
             // Instructions per wall-clock second on the host: real emulation
             // speed, not the PROM's inventory "MHz".
-            parts.push(format!("{:.0} MIPS", self.emu.status.mips));
+            parts.push(t!("status-mips", mips = format!("{:.0}", self.emu.status.mips)));
             // The kernel's own clock-tick rate (CP0 Compare, or the IOC's 8254
             // timer interrupts) — distinct from MIPS; see the default layout's
             // status footer.
-            parts.push(format!("{:.0} Hz", self.emu.status.kernel_hz));
+            parts.push(t!("status-kernel-hz", hz = format!("{:.0}", self.emu.status.kernel_hz)));
         }
         if running {
             // The backend is latched at Start; "idle" means the running guest
             // has produced no IP traffic yet.
             let backend = match self.launched_net.as_ref() {
                 Some((NetMode::Pcap, iface)) => {
-                    let iface = iface.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto");
-                    format!("PCAP {iface}")
+                    let iface = iface
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| t!("common-auto"));
+                    t!("macos-status-net-bridged", iface = iface)
                 }
-                _ => "NAT".to_string(),
+                _ => t!("status-net-nat"),
             };
-            let live = match self.emu.net_state() {
-                NetState::Active => "",
-                NetState::Idle => " idle",
-                NetState::Off => " off",
-            };
-            parts.push(format!("net {backend}{live}"));
+            parts.push(match self.emu.net_state() {
+                NetState::Active => t!("macos-status-net", backend = backend),
+                NetState::Idle => t!("macos-status-net-idle", backend = backend),
+                NetState::Off => t!("macos-status-net-off", backend = backend),
+            });
             if self.fb_scale > 0.0 {
-                // "filtered": not a whole device-pixel multiple, so smoothed.
-                let filtered = if self.fb_nearest { "" } else { " filtered" };
-                parts.push(format!("{}{filtered}", menus::scale_label(self.fb_scale)));
+                // Smoothed: not a whole device-pixel multiple.
+                let scale = menus::scale_number(self.fb_scale);
+                parts.push(if self.fb_nearest {
+                    t!("status-scale", scale = scale)
+                } else {
+                    t!("status-scale-filtered", scale = scale)
+                });
             }
         }
         if running && self.emu.status.dirty_cow > 0 {
-            parts.push(format!("dirty COW: {}", self.emu.status.dirty_cow));
+            parts.push(t!("status-dirty-sectors", count = self.emu.status.dirty_cow));
         }
         if self.input_state.captured {
-            parts.push(format!("captured \u{2014} {} to release", input::RELEASE_HINT));
+            parts.push(t!("main-capture-release", keys = input::RELEASE_HINT));
         }
         if let Some((msg, when)) = &self.toast {
             if when.elapsed().as_secs() < 5 {
-                parts.push(msg.clone());
+                // A title is one line; some toasts are several.
+                parts.push(msg.split_whitespace().collect::<Vec<_>>().join(" "));
             }
         }
-        format!("IRIS \u{2014} {}", parts.join("  \u{00b7}  "))
+        t!("macos-title", status = parts.join("  \u{00b7}  "))
     }
 
     /// Push the title at about 4 Hz, and only when it changed. Most of its

@@ -80,6 +80,25 @@ painted in a previous pass, and only then is it dropped. This is an eframe 0.36
 - `NSWindow.allowsAutomaticWindowTabbing = false` is set before launch.
   Otherwise AppKit tabs the config window into a fullscreen main window.
 
+## Text comes from the catalogs
+
+Every string the backend shows goes through `t!` (see
+`i18n-catalog-gotchas.md`). Reuse the default layout's id when the native item
+is the same control (`menu-*`, `scsi-*`, `status-*`, `toast-*`), so the two
+layouts read the same and a translation covers both. Only text the default
+layout has no equivalent for gets a `macos-*` id in `locales/en/macos.ftl`.
+
+- Don't use a `*-tip` id as a menu label; translators may write a sentence.
+- A `*-subtitle` id the catalog leaves empty is hidden. `menus::info` returns
+  no rows for an empty string (and one row per line otherwise, since a menu
+  item's title is one line), so an `Item::Info` line disappears the same way.
+- `i18n::languages()` parses every catalog the first time; it is cached
+  because the menu model asks for it on every rebuild.
+- The menu model is rebuilt from `t!` every 200 ms, so a language change from
+  View → Language reaches the menu bar, the app menu and the title on its own.
+  A native window's viewport id hashes its title, so a window open during the
+  switch reopens as a new OS window.
+
 ## Status in the title
 
 `window_title()` is pushed at about 4 Hz, and only when the text changed. The

@@ -54,6 +54,8 @@ pub enum Action {
     ToggleFullscreen,
     SetVmScale(f32),
     SetUiScale(f32),
+    /// A language code from `i18n::languages()`, or empty for the system's.
+    SetLanguage(String),
     ShowConfig,
 
     // --- Help ---
@@ -92,6 +94,17 @@ pub enum ScsiCmd {
 pub struct Accel {
     pub key: char,
     pub shift: bool,
+}
+
+/// Lines of explanation, one row each, or nothing when the catalog leaves the
+/// text empty (the default layout's `subtitle` convention). A menu item's
+/// title is a single line, so a multi-line value is split.
+fn info(text: String) -> Vec<Item> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| Item::Info(l.to_string()))
+        .collect()
 }
 
 /// One row of a menu.
@@ -159,13 +172,17 @@ impl Item {
     }
 }
 
-/// "1×", "1.25×" — trailing zeros dropped so the common whole steps read clean.
+/// "1", "1.25", "1.33": a scale factor to two decimals, trailing zeros dropped
+/// so the common whole steps read clean (as the default layout's status footer
+/// writes it). Catalog strings add the "×".
+pub fn scale_number(s: f32) -> String {
+    let text = format!("{s:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// "1×", "1.25×", for the scale choices themselves.
 pub fn scale_label(s: f32) -> String {
-    if (s - s.round()).abs() < 0.005 {
-        format!("{:.0}\u{00d7}", s.round())
-    } else {
-        format!("{s}\u{00d7}")
-    }
+    format!("{}\u{00d7}", scale_number(s))
 }
 
 /// Steps of a scale slider, as menu-friendly discrete choices.
@@ -202,12 +219,12 @@ impl App {
     fn file_menu(&self) -> Menu {
         let can_change = self.emu.can_change_directory();
         let mut items = vec![
-            act("New machine\u{2026}", Action::NewMachine).accel('n').enabled_if(can_change),
+            act(t!("menu-file-new-machine"), Action::NewMachine).accel('n').enabled_if(can_change),
         ];
 
         let mut machines: Vec<Item> = Vec::new();
         if self.prefs.machines.is_empty() {
-            machines.push(Item::Info("(no saved machines yet)".into()));
+            machines.push(Item::Info(t!("menu-file-no-machines")));
         }
         for name in self.prefs.machines.keys() {
             let active = self.prefs.active_machine.as_deref() == Some(name.as_str());
@@ -217,18 +234,18 @@ impl App {
                     .enabled_if(can_change),
             );
         }
-        items.push(Item::Sub { label: "Switch to machine".into(), items: machines });
+        items.push(Item::Sub { label: t!("menu-file-switch-machine"), items: machines });
 
         let has_active = self.prefs.active_machine.is_some();
         items.push(
-            act("Rename current\u{2026}", Action::RenameMachine).enabled_if(has_active && can_change),
+            act(t!("menu-file-rename-machine"), Action::RenameMachine).enabled_if(has_active && can_change),
         );
         items.push(
-            act("Delete current machine", Action::DeleteMachine).enabled_if(has_active && can_change),
+            act(t!("menu-file-delete-machine"), Action::DeleteMachine).enabled_if(has_active && can_change),
         );
 
         items.push(Item::Separator);
-        items.push(act("Configuration\u{2026}", Action::ShowConfig).accel(','));
+        items.push(act(t!("macos-file-settings"), Action::ShowConfig).accel(','));
 
         // A source-build affordance for users who also run the standalone
         // `iris` CLI: it flushes the active machine's own TOML and reports
@@ -236,7 +253,7 @@ impl App {
         // folder — see prepare_for_premiere). Hidden in pre-compiled / App
         // Store builds (the `bundled` feature). See iris-gui Cargo.toml.
         if !cfg!(feature = "bundled") {
-            items.push(act("Prepare for premiere\u{2026}", Action::PrepareForPremiere));
+            items.push(act(t!("menu-file-premiere"), Action::PrepareForPremiere));
         }
 
         // App Store sandbox: grant a whole folder (recursive) so the disk-sync
@@ -245,37 +262,41 @@ impl App {
         // by one grant. Hidden elsewhere.
         if cfg!(feature = "appstore") {
             items.push(Item::Separator);
-            items.push(act("Grant a disk folder\u{2026}", Action::GrantDiskFolder));
+            items.push(Item::Info(t!("menu-file-folders-heading")));
+            items.push(act(t!("menu-file-grant-folder"), Action::GrantDiskFolder));
             if self.prefs.disk_folders.is_empty() {
-                items.push(Item::Info("(no folders granted yet)".into()));
+                items.push(Item::Info(t!("menu-file-no-folders")));
             }
             for f in &self.prefs.disk_folders {
                 // Live access state: a grant can lapse mid-session, and the
                 // only fix is to re-grant, so say which it is.
-                let live = crate::folder_accessible(f);
-                let state = if live { "granted" } else { "no access \u{2014} re-grant" };
+                let label = if crate::folder_accessible(f) {
+                    t!("macos-file-folder-granted", path = f)
+                } else {
+                    t!("macos-file-folder-lapsed", path = f)
+                };
                 items.push(Item::Sub {
-                    label: format!("{f}  ({state})"),
+                    label,
                     items: vec![
-                        act("Reveal in file manager", Action::RevealFolder(f.clone())),
-                        act("Revoke", Action::RevokeFolder(f.clone())),
+                        act(t!("macos-file-folder-reveal"), Action::RevealFolder(f.clone())),
+                        act(t!("macos-file-folder-revoke"), Action::RevokeFolder(f.clone())),
                     ],
                 });
             }
         }
 
         items.push(Item::Separator);
-        items.push(act("Quit", Action::Quit).accel('q'));
-        Menu { title: "File".into(), items }
+        items.push(act(t!("menu-file-quit"), Action::Quit).accel('q'));
+        Menu { title: t!("menu-file"), items }
     }
 
     fn machine_menu(&self) -> Menu {
         let running = self.emu.is_running();
         let mut items = vec![
-            act("Start", Action::Start).enabled_if(!running).accel('r'),
-            act("Stop", Action::Stop).enabled_if(running).accel_shift('r'),
-            act("Reset", Action::Reset).enabled_if(running),
-            act("Reset NVRAM (fresh PRAM)", Action::ResetNvram).enabled_if(!running),
+            act(t!("menu-machine-start"), Action::Start).enabled_if(!running).accel('r'),
+            act(t!("menu-machine-stop"), Action::Stop).enabled_if(running).accel_shift('r'),
+            act(t!("menu-machine-reset"), Action::Reset).enabled_if(running),
+            act(t!("menu-machine-reset-nvram"), Action::ResetNvram).enabled_if(!running),
             Item::Separator,
         ];
 
@@ -292,18 +313,18 @@ impl App {
             cpus.push(Item::Separator);
             match self.started_cpu {
                 Some(started) if started != self.cfg.machine.cpu => cpus.push(Item::Info(
-                    format!("Running: {} \u{2014} Stop to apply edits", started.label()),
+                    t!("menu-machine-running-pending", cpu = started.label()),
                 )),
-                Some(started) => cpus.push(Item::Info(format!("Running: {}", started.label()))),
+                Some(started) => cpus.push(Item::Info(t!("menu-machine-running", cpu = started.label()))),
                 None => {}
             }
             // Matches the default layout's menu_list Machine-menu hint — the
             // radio items above are disabled while running for the same
             // reason.
-            cpus.push(Item::Info("CPU changes apply after Stop \u{2192} Start".into()));
+            cpus.extend(info(t!("menu-machine-cpu-subtitle")));
         }
         items.push(Item::Sub {
-            label: format!("Processor: {}", self.cfg.machine.cpu.label()),
+            label: t!("menu-machine-processor", cpu = self.cfg.machine.cpu.label()),
             items: cpus,
         });
 
@@ -316,18 +337,18 @@ impl App {
                 .map(|name| act(*name, kind(name.to_string())).enabled_if(running))
                 .collect()
         };
-        items.push(Item::Sub { label: "Save state".into(), items: slots(Action::SaveState) });
-        items.push(Item::Sub { label: "Restore state".into(), items: slots(Action::RestoreState) });
+        items.push(Item::Sub { label: t!("menu-machine-save-state"), items: slots(Action::SaveState) });
+        items.push(Item::Sub { label: t!("menu-machine-restore-state"), items: slots(Action::RestoreState) });
         items.push(Item::Separator);
-        items.push(act("Screenshot\u{2026}", Action::Screenshot).enabled_if(running));
-        items.push(act("Serial console\u{2026}", Action::SerialConsole).enabled_if(running));
+        items.push(act(t!("menu-machine-screenshot"), Action::Screenshot).enabled_if(running));
+        items.push(act(t!("menu-machine-serial-console"), Action::SerialConsole).enabled_if(running));
         items.push(Item::Separator);
         items.push(
             act(
                 if self.input_state.captured {
-                    format!("Release mouse & keyboard ({})", crate::input::RELEASE_HINT)
+                    t!("macos-machine-release-capture", keys = crate::input::RELEASE_HINT)
                 } else {
-                    "Capture mouse & keyboard".into()
+                    t!("main-capture")
                 },
                 Action::ToggleCapture,
             )
@@ -339,58 +360,59 @@ impl App {
             // early on the uncaptured path before it sets f11_to_guest), and
             // the default layout's capture_controls only shows this line in
             // the same state — surface it here too.
-            items.push(Item::Info("Send F11 to IRIX: Ctrl+Alt+F11".into()));
+            items.extend(info(t!("main-capture-f11-subtitle")));
         }
-        Menu { title: "Machine".into(), items }
+        Menu { title: t!("menu-machine"), items }
     }
 
     fn memory_menu(&self) -> Menu {
         let running = self.emu.is_running();
-        let mut items = vec![Item::Info(format!(
-            "Config: {}",
-            crate::ram_summary(&self.cfg.banks)
+        let mut items = vec![Item::Info(t!(
+            "menu-memory-configured",
+            ram = crate::ram_summary(&self.cfg.banks)
         ))];
         if running {
             if let Some(started) = self.started_banks {
                 if started != self.cfg.banks {
-                    items.push(Item::Info(format!(
-                        "Running: {} \u{2014} Stop to apply edits",
-                        crate::ram_summary(&started)
+                    items.push(Item::Info(t!(
+                        "menu-memory-running-pending",
+                        ram = crate::ram_summary(&started)
                     )));
                 } else {
-                    items.push(Item::Info(format!("Running: {}", crate::ram_summary(&started))));
+                    items.push(Item::Info(t!("menu-memory-running", ram = crate::ram_summary(&started))));
                 }
             }
-            items.push(Item::Info("RAM changes apply after Stop \u{2192} Start".into()));
+            items.extend(info(t!("menu-memory-running-subtitle")));
         } else {
-            items.push(Item::Info("Applied at next Start".into()));
+            items.extend(info(t!("menu-memory-stopped-subtitle")));
         }
         let ip28_banks = self.cfg.machine.profile.ip28();
         items.push(Item::Separator);
-        items.push(Item::Info("Quick presets (auto-distributed)".into()));
+        items.push(Item::Info(t!("menu-memory-presets")));
         for &p in crate::ram::ram_presets(ip28_banks) {
             items.push(
-                act(format!("{p} MB"), Action::SetRam(p))
+                act(t!("menu-memory-size", mb = p), Action::SetRam(p))
                     .enabled_if(!running)
                     .checked_if(self.cfg.banks == crate::distribute_ram(p, ip28_banks)),
             );
         }
         items.push(Item::Separator);
+        items.push(Item::Info(t!("menu-memory-banks")));
         for i in 0..4 {
             let banks: Vec<Item> = iris::config::VALID_BANK_SIZES
                 .iter()
                 .map(|&sz| {
-                    act(format!("{sz} MB"), Action::SetBank(i, sz))
+                    act(t!("menu-memory-size", mb = sz), Action::SetBank(i, sz))
                         .enabled_if(!running && (sz <= 128 || ip28_banks))
                         .checked_if(self.cfg.banks[i] == sz)
                 })
                 .collect();
             items.push(Item::Sub {
-                label: format!("Bank {i}: {} MB", self.cfg.banks[i]),
+                label: t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]),
                 items: banks,
             });
         }
-        Menu { title: "Memory".into(), items }
+        Menu { title: t!("menu-memory"), items }
     }
 
     fn scsi_menu(&self) -> Menu {
@@ -400,69 +422,69 @@ impl App {
             let label = crate::scsi_menu::render_label(id, dev);
             let sub = match dev {
                 None => vec![
-                    act("Attach HDD\u{2026}", Action::Scsi(ScsiCmd::PickHdd(id))),
+                    act(t!("scsi-attach-hdd"), Action::Scsi(ScsiCmd::PickHdd(id))),
                     // Attaching a CD-ROM gives an empty drive by default; the
                     // user loads media afterwards via "Insert disc…". Mirrors
                     // real hardware and avoids an upfront file prompt.
-                    act("Attach CD-ROM drive (empty)", Action::Scsi(ScsiCmd::AttachEmptyCdrom(id))),
-                    act("Attach CD-ROM with disc\u{2026}", Action::Scsi(ScsiCmd::PickCdromWithDisc(id))),
-                    act("Create blank HDD image\u{2026}", Action::Scsi(ScsiCmd::CreateBlank(id))),
+                    act(t!("scsi-attach-cdrom-empty"), Action::Scsi(ScsiCmd::AttachEmptyCdrom(id))),
+                    act(t!("scsi-attach-cdrom-disc"), Action::Scsi(ScsiCmd::PickCdromWithDisc(id))),
+                    act(t!("scsi-create-blank"), Action::Scsi(ScsiCmd::CreateBlank(id))),
                 ],
-                Some(d) if d.is_daynaport() => vec![
-                    Item::Info("DaynaPort SCSI/Link (Ethernet).".into()),
-                    Item::Info("Configure its MAC and subnet on the Disks tab.".into()),
-                    Item::Separator,
-                    act("Detach DaynaPort", Action::Scsi(ScsiCmd::Detach(id))),
-                ],
+                Some(d) if d.is_daynaport() => {
+                    let mut v = info(t!("scsi-daynaport-subtitle"));
+                    if !v.is_empty() {
+                        v.push(Item::Separator);
+                    }
+                    v.push(act(t!("scsi-detach-daynaport"), Action::Scsi(ScsiCmd::Detach(id))));
+                    v
+                }
                 Some(d) if d.is_cdrom() => {
                     let has_media =
                         !d.path.is_empty() && std::path::Path::new(&d.path).exists();
                     let mut v = Vec::new();
                     if has_media {
-                        v.push(act("Eject (tray empty)", Action::Scsi(ScsiCmd::Eject(id))));
+                        v.push(act(t!("scsi-eject"), Action::Scsi(ScsiCmd::Eject(id))));
                     }
                     v.push(act(
-                        if has_media { "Swap disc\u{2026}" } else { "Insert disc\u{2026}" },
+                        if has_media { t!("scsi-change-disc") } else { t!("scsi-insert-disc") },
                         Action::Scsi(ScsiCmd::PickDisc(id)),
                     ));
                     if has_media {
-                        v.push(act("Mount /CDROM in IRIX\u{2026}", Action::Scsi(ScsiCmd::Remount(id))));
+                        v.push(act(t!("scsi-mount-in-irix"), Action::Scsi(ScsiCmd::Remount(id))));
                     }
                     v.push(Item::Separator);
-                    v.push(act("Detach CD-ROM drive", Action::Scsi(ScsiCmd::Detach(id))));
+                    v.push(act(t!("scsi-detach-cdrom"), Action::Scsi(ScsiCmd::Detach(id))));
                     v
                 }
                 Some(d) => vec![
                     act(
                         if d.overlay {
-                            "Disable COW overlay"
+                            t!("scsi-overlay-disable")
                         } else {
-                            "Enable COW overlay (writes \u{2192} .overlay)"
+                            t!("scsi-overlay-enable")
                         },
                         Action::Scsi(ScsiCmd::ToggleOverlay(id)),
                     ),
-                    act("Replace image\u{2026}", Action::Scsi(ScsiCmd::PickHdd(id))),
+                    act(t!("scsi-replace-image"), Action::Scsi(ScsiCmd::PickHdd(id))),
                     Item::Separator,
-                    act("Detach hard drive", Action::Scsi(ScsiCmd::Detach(id))),
+                    act(t!("scsi-detach-hdd"), Action::Scsi(ScsiCmd::Detach(id))),
                 ],
             };
             items.push(Item::Sub { label, items: sub });
         }
-        items.push(Item::Separator);
-        items.push(Item::Info(
-            "CD-ROM: prefer SCSI #4. Insert/Swap hot-loads media and remounts".into(),
-        ));
-        items.push(Item::Info(
-            "/CDROM (console shell must be active). New drives need Stop\u{2192}Start.".into(),
-        ));
+        let hint = info(t!("scsi-menu-subtitle"));
+        if !hint.is_empty() {
+            items.push(Item::Separator);
+            items.extend(hint);
+        }
 
         // Copy-on-write overlays with something in them: commit or roll back.
         let cow = self.cow_entries();
         if !cow.is_empty() {
             items.push(Item::Separator);
-            items.push(Item::Info("Copy-on-write changes".into()));
+            items.push(Item::Info(t!("menu-cow-heading")));
             if self.emu.is_running() {
-                items.push(Item::Info("Stop the machine to commit or roll back.".into()));
+                items.push(Item::Info(t!("menu-cow-stop-first")));
             } else {
                 for (id, base, is_chd) in cow {
                     let name = std::path::Path::new(&base)
@@ -471,14 +493,14 @@ impl App {
                         .unwrap_or(&base)
                         .to_string();
                     items.push(Item::Sub {
-                        label: format!("SCSI {id}: {name}"),
+                        label: t!("menu-cow-disk", id = id, name = name),
                         items: vec![
                             act(
-                                "Commit changes to disk",
+                                t!("menu-cow-commit"),
                                 Action::CowCommit { base: base.clone(), chd: is_chd },
                             ),
                             act(
-                                "Discard changes (roll back)",
+                                t!("menu-cow-discard"),
                                 Action::CowDiscard { id, base: base.clone(), chd: is_chd },
                             ),
                         ],
@@ -486,13 +508,13 @@ impl App {
                 }
             }
         }
-        Menu { title: "SCSI".into(), items }
+        Menu { title: t!("menu-scsi"), items }
     }
 
     fn view_menu(&self) -> Menu {
         let mut items = vec![
             act(
-                if self.fullscreen { "Exit fullscreen" } else { "Fullscreen" },
+                if self.fullscreen { t!("macos-view-exit-fullscreen") } else { t!("macos-view-fullscreen") },
                 Action::ToggleFullscreen,
             )
             .accel('f'),
@@ -514,7 +536,7 @@ impl App {
         })
         .collect();
         items.push(Item::Sub {
-            label: format!("Emulator scale: {}", scale_label(self.prefs.vm_scale)),
+            label: t!("macos-view-vm-scale", scale = scale_number(self.prefs.vm_scale)),
             items: vm,
         });
 
@@ -526,11 +548,24 @@ impl App {
             })
             .collect();
         items.push(Item::Sub {
-            label: format!("Menu & dialog scale: {}", scale_label(self.prefs.ui_scale)),
+            label: t!("macos-view-ui-scale", scale = scale_number(self.prefs.ui_scale)),
             items: ui_steps,
         });
 
-        Menu { title: "View".into(), items }
+        items.push(Item::Separator);
+        let current = &self.prefs.language;
+        let mut languages = vec![
+            act(t!("menu-view-language-system"), Action::SetLanguage(String::new()))
+                .checked_if(current.is_empty()),
+        ];
+        for (code, name) in crate::i18n::languages() {
+            languages.push(
+                act(name, Action::SetLanguage(code.to_string())).checked_if(current == code),
+            );
+        }
+        items.push(Item::Sub { label: t!("menu-view-language"), items: languages });
+
+        Menu { title: t!("menu-view"), items }
     }
 
     fn help_menu(&self) -> Menu {
@@ -541,31 +576,31 @@ impl App {
         let nat_running = running
             && matches!(self.launched_net.as_ref(), Some((iris::config::NetMode::Nat, _)));
         let mut items = vec![
-            Item::Info("Diagnostics".into()),
-            act("Test camera\u{2026}", Action::CameraTest).enabled_if(running),
-            act("Serial console\u{2026}", Action::SerialConsole).enabled_if(running),
-            act("Check networking\u{2026}", Action::NetCheck).enabled_if(nat_running),
+            Item::Info(t!("menu-help-diagnostics")),
+            act(t!("menu-help-test-camera"), Action::CameraTest).enabled_if(running),
+            act(t!("menu-help-serial-console"), Action::SerialConsole).enabled_if(running),
+            act(t!("macos-help-net-check"), Action::NetCheck).enabled_if(nat_running),
             Item::Separator,
-            act("How camera & networking work\u{2026}", Action::HelpInfo),
-            act("Mount the shared folder in IRIX\u{2026}", Action::NfsHelp),
+            act(t!("menu-help-camera-network"), Action::HelpInfo),
+            act(t!("menu-help-nfs"), Action::NfsHelp),
         ];
         // N64 dev board getting-started guide. Ultra64 is always compiled in
         // now (see the "feature flag cleanups" commit), but it never runs in
         // App Store builds (needs an external gopher64 over POSIX shm).
         if !cfg!(feature = "appstore") {
-            items.push(act("N64 development board (Ultra64)\u{2026}", Action::Ultra64Help));
+            items.push(act(t!("menu-help-ultra64"), Action::Ultra64Help));
         }
         items.push(Item::Separator);
-        items.push(act("Licenses\u{2026}", Action::License));
-        items.push(act("Privacy policy\u{2026}", Action::Privacy));
+        items.push(act(t!("menu-help-licenses"), Action::License));
+        items.push(act(t!("menu-help-privacy"), Action::Privacy));
         items.push(Item::Separator);
         items.push(act(
-            "IRIS on GitHub",
+            t!("macos-help-github"),
             Action::OpenUrl("https://github.com/techomancer/iris"),
         ));
         items.push(Item::Separator);
-        items.push(act("About IRIS", Action::About));
-        Menu { title: "Help".into(), items }
+        items.push(act(t!("macos-app-about"), Action::About));
+        Menu { title: t!("menu-help"), items }
     }
 }
 
@@ -643,27 +678,28 @@ impl App {
                 let mut errors = Vec::new();
                 match settings::reset_nvram(&self.cfg.nvram) {
                     Ok(()) => { let _ = settings::write_nvram_mac(&self.cfg.nvram, mac); }
-                    Err(e) => errors.push(format!("NVRAM reset failed: {e}")),
+                    Err(e) => errors.push(t!("toast-nvram-reset-failed", error = e.to_string())),
                 }
                 match settings::reset_nveeprom(&self.cfg.nveeprom) {
                     Ok(()) => { let _ = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac); }
-                    Err(e) => errors.push(format!("NVRAM EEPROM reset failed: {e}")),
+                    Err(e) => errors.push(t!("toast-nveeprom-reset-failed", error = e.to_string())),
                 }
                 self.toast(if errors.is_empty() {
-                    format!("NVRAM reset \u{2014} new MAC {}", settings::mac_to_string(mac))
+                    t!("toast-nvram-reset", mac = settings::mac_to_string(mac))
                 } else {
-                    errors.join("; ")
+                    // One line: the toast is shown in the window title.
+                    errors.join(" ")
                 });
             }
             Action::SetCpu(c) => {
                 self.cfg.machine.cpu = c;
                 self.mark_dirty();
-                self.toast(format!("{} \u{2014} applies at next Start", c.label()));
+                self.toast(t!("toast-cpu-set", cpu = c.label()));
             }
             Action::SaveState(slot) => self.emu.send(Cmd::SaveState(slot)),
             Action::RestoreState(slot) => self.emu.send(Cmd::RestoreState(slot)),
             Action::Screenshot => {
-                if let Some(p) = crate::native_save_dialog("Save screenshot", &[("PNG", &["png"])]) {
+                if let Some(p) = crate::native_save_dialog(&t!("menu-machine-screenshot-title"), &[("PNG", &["png"])]) {
                     self.emu.send(Cmd::Screenshot(p));
                 }
             }
@@ -680,10 +716,10 @@ impl App {
             Action::SetRam(mb) => {
                 self.cfg.banks = crate::distribute_ram(mb, self.cfg.machine.profile.ip28());
                 self.mark_dirty();
-                self.toast(format!(
-                    "RAM set to {} ({:?})",
-                    crate::ram_summary(&self.cfg.banks),
-                    self.cfg.banks
+                self.toast(t!(
+                    "toast-ram-set",
+                    ram = crate::ram_summary(&self.cfg.banks),
+                    banks = format!("{:?}", self.cfg.banks)
                 ));
             }
             Action::SetBank(i, sz) => {
@@ -722,6 +758,14 @@ impl App {
                 self.pending_fb_snap = true;
                 let _ = self.prefs.save();
             }
+            Action::SetLanguage(code) => {
+                self.prefs.language = code;
+                crate::i18n::set_language(&self.prefs.language);
+                if let Err(e) = self.prefs.save() {
+                    self.toast(e);
+                }
+                self.invalidate_menus();
+            }
             Action::ShowConfig => self.show_config_editor = true,
 
             // --- Help ---
@@ -745,15 +789,19 @@ impl App {
         let picked = match cmd {
             ScsiCmd::PickHdd(id) => {
                 let cur = self.cfg.scsi.get(&id).map(|d| d.path.clone()).unwrap_or_default();
-                let title = if cur.is_empty() { "Attach HDD" } else { "Replace HDD image" };
-                sm::pick_disk(title, &cur).map(|path| ScsiAction::AttachHdd { id, path })
+                let title = if cur.is_empty() {
+                    t!("scsi-attach-hdd-picker")
+                } else {
+                    t!("scsi-replace-image-picker")
+                };
+                sm::pick_disk(&title, &cur).map(|path| ScsiAction::AttachHdd { id, path })
             }
             ScsiCmd::AttachEmptyCdrom(id) => Some(ScsiAction::AttachEmptyCdrom { id }),
-            ScsiCmd::PickCdromWithDisc(id) => sm::pick_iso("Attach CD-ROM with disc", "")
+            ScsiCmd::PickCdromWithDisc(id) => sm::pick_iso(&t!("scsi-attach-cdrom-disc-picker"), "")
                 .map(|path| ScsiAction::AttachCdromWithDisc { id, path }),
             ScsiCmd::PickDisc(id) => {
                 let cur = self.cfg.scsi.get(&id).map(|d| d.path.clone()).unwrap_or_default();
-                sm::pick_iso("Insert disc", &cur).map(|path| ScsiAction::InsertDisc { id, path })
+                sm::pick_iso(&t!("scsi-insert-disc-picker"), &cur).map(|path| ScsiAction::InsertDisc { id, path })
             }
             ScsiCmd::Eject(id) => Some(ScsiAction::Eject { id }),
             ScsiCmd::Detach(id) => Some(ScsiAction::Detach { id }),
@@ -765,11 +813,9 @@ impl App {
             ScsiCmd::Remount(id) => {
                 if self.emu.is_running() {
                     self.emu.send(Cmd::RemountCdrom { id });
-                    self.toast(format!(
-                        "SCSI #{id}: remount sent \u{2014} keep a shell focused on the console"
-                    ));
+                    self.toast(t!("toast-cdrom-remount-sent", id = id));
                 } else {
-                    self.toast("Mount /CDROM: start the VM first");
+                    self.toast(t!("toast-cdrom-remount-not-running"));
                 }
                 None
             }
@@ -793,7 +839,7 @@ impl App {
         match (live, self.emu.is_running()) {
             (Some(cmd), true) => self.emu.send(cmd),
             (Some(_), false) if was_insert => {
-                self.toast("Disc saved \u{2014} Stop\u{2192}Start to load into SCSI drive")
+                self.toast(t!("toast-disc-saved"))
             }
             _ => {}
         }
