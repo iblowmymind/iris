@@ -248,7 +248,7 @@ pub fn derive(base: Ipv4Addr, prefix: u8) -> Derived {
 /// A soft (overridable) problem with a chosen subnet, plus a safe suggestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoftWarn {
-    /// Human-readable reason (e.g. "overlaps your en0 (192.168.1.5)").
+    /// Human-readable reason (e.g. "Overlaps en0 (192.168.1.5) on this computer.").
     pub reason: String,
     /// A known-good network to offer via "Use suggested" (always a /24).
     pub suggestion_net: Ipv4Addr,
@@ -276,10 +276,7 @@ pub fn classify(base: Ipv4Addr, prefix: u8, host: &[HostIface]) -> Assessment {
     if prefix == 0 || prefix > MAX_PREFIX {
         return Assessment {
             derived: None,
-            hard_error: Some(format!(
-                "prefix /{} is out of range; use /1 to /{} (the Indy's NAT needs at least a /{})",
-                prefix, MAX_PREFIX, MAX_PREFIX
-            )),
+            hard_error: Some(t!("netplan-prefix-out-of-range", prefix = prefix, max = MAX_PREFIX)),
             off_boundary: None,
             soft: None,
         };
@@ -291,12 +288,12 @@ pub fn classify(base: Ipv4Addr, prefix: u8, host: &[HostIface]) -> Assessment {
 
     let soft = match block_of(net) {
         None => Some(SoftWarn {
-            reason: format!("{} isn't a private (RFC1918) range", net),
+            reason: t!("netplan-not-private", network = net.to_string()),
             suggestion_net: first_free_24(PrivateBlock::C, host),
             suggestion_prefix: 24,
         }),
         Some(block) => conflict(net, prefix, host).map(|h| SoftWarn {
-            reason: format!("overlaps your {} ({})", h.name, h.addr),
+            reason: t!("netplan-overlaps-host", interface = &h.name, address = h.addr.to_string()),
             suggestion_net: first_free_24(block, host),
             suggestion_prefix: 24,
         }),
@@ -341,7 +338,9 @@ pub fn commas(n: u64) -> String {
 
 /// Label for a mask-dropdown entry, e.g. `/24 = 255.255.255.0 (254 hosts)`.
 pub fn mask_label(prefix: u8) -> String {
-    format!("/{} = {} ({} hosts)", prefix, netmask(prefix), commas(usable_hosts(prefix)))
+    let count = usable_hosts(prefix);
+    t!("netplan-mask-option", prefix = prefix, mask = netmask(prefix).to_string(),
+       count = count, hosts = commas(count))
 }
 
 #[cfg(test)]

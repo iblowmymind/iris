@@ -263,6 +263,7 @@ cd "$HOME/Library/Application Support/iris/machines/indy"
 {
   "ui_scale": 1.25,
   "vm_scale": 0.75,
+  "language": "",
   "active_machine": "indy",
   "recent_configs": [],
   "last_config": null,
@@ -270,6 +271,9 @@ cd "$HOME/Library/Application Support/iris/machines/indy"
   "disk_folders": []
 }
 ```
+
+`language` is a folder name under `iris-gui/locales` (View → Language);
+empty follows the system language.
 
 The legacy `recent_configs` and `last_config` keys remain compatible with
 older preferences. Machine configurations are never serialized into this JSON.
@@ -484,6 +488,11 @@ a build feature — read `MachineConfig::machine.cpu`.
 
 ### Conventions
 
+- Every user-visible string is a Fluent message in `iris-gui/locales/<lang>/*.ftl`,
+  looked up with `t!("id")` (`src/i18n.rs`). Optional captions and tooltips go
+  through `subtitle()` and `.tip()`, which draw nothing when the catalog value
+  is empty. `locales/README.md` covers the writing style and adding a language;
+  `cargo test -p iris-gui i18n` checks ids and arguments against the code.
 - `Result<T, String>` for fallible APIs (matches in-tree iris style; no
   anyhow / thiserror).
 - `log` macros for diagnostics; the existing iris `devlog` module

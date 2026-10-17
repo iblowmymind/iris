@@ -11,10 +11,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         || name.chars().any(char::is_control)
         || name.ends_with(['.', ' '])
     {
-        return Err(
-            "Use a machine name without path separators, leading dots, or trailing dots/spaces"
-                .into(),
-        );
+        return Err(t!("machines-name-invalid"));
     }
     // These names cannot be directories on Windows, even with an extension.
     let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
@@ -24,9 +21,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
             && matches!(stem.as_bytes()[3], b'1'..=b'9'))
         || name.contains(['<', '>', '"', '|', '?', '*'])
     {
-        return Err(
-            "This machine name is reserved or contains unsupported filename characters".into(),
-        );
+        return Err(t!("machines-name-reserved"));
     }
     Ok(())
 }
@@ -69,8 +64,13 @@ pub fn config_path(root: &Path, name: &str) -> Result<PathBuf, String> {
 }
 
 pub fn read(path: &Path) -> Result<MachineConfig, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    let text = std::fs::read_to_string(path).map_err(|e| file_error(path, e))?;
+    toml::from_str(&text).map_err(|e| file_error(path, e))
+}
+
+/// A file that couldn't be read or written, as shown to the user.
+pub fn file_error(path: &Path, error: impl std::fmt::Display) -> String {
+    t!("machines-file-error", path = path.display(), error = error.to_string())
 }
 
 /// Replace a config only after serialization and the complete write succeed.
@@ -88,7 +88,7 @@ pub fn write(path: &Path, text: &str) -> Result<(), String> {
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result.map_err(|e| format!("{}: {e}", path.display()))
+    result.map_err(|e| file_error(path, e))
 }
 
 /// Visit filesystem paths only. Network interfaces, MACs, subnets, debug module
@@ -132,11 +132,7 @@ pub fn relative(base: &Path, path: &Path) -> Result<PathBuf, String> {
     let base_parts: Vec<_> = base.components().collect();
     let path_parts: Vec<_> = path.components().collect();
     if !base.is_absolute() || !path.is_absolute() || base_parts.first() != path_parts.first() {
-        return Err(format!(
-            "Cannot express {} relative to {}",
-            path.display(),
-            base.display()
-        ));
+        return Err(t!("machines-relative-error", path = path.display(), base = base.display()));
     }
     let common = base_parts
         .iter()
@@ -190,7 +186,7 @@ pub fn discover(
     let entries = match std::fs::read_dir(root.join("machines")) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (machines, errors),
-        Err(e) => return (machines, vec![format!("Cannot list machines: {e}")]),
+        Err(e) => return (machines, vec![t!("machines-list-error", error = e.to_string())]),
     };
     for entry in entries {
         let entry = match entry {
@@ -212,7 +208,7 @@ pub fn discover(
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                errors.push(format!("{}: {e}", path.display()));
+                errors.push(file_error(&path, e));
                 continue;
             }
         }
@@ -272,7 +268,9 @@ pub fn migrate(root: &Path, name: &str, cfg: &MachineConfig, old_cwd: &Path) -> 
             match std::fs::copy(&source, &dest) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("Cannot migrate {}: {e}", source.display())),
+                Err(e) => {
+                    return Err(t!("machines-migrate-error", path = source.display(), error = e.to_string()))
+                }
             }
         }
         *path = leaf.into();
@@ -312,7 +310,7 @@ pub fn rename(root: &Path, old: &str, new: &str) -> Result<(), String> {
     let old_dir = directory(root, old)?;
     let new_dir = directory(root, new)?;
     if new_dir.exists() {
-        return Err(format!("Machine folder '{new}' already exists"));
+        return Err(t!("machines-folder-exists", name = new));
     }
     std::fs::rename(&old_dir, &new_dir).map_err(|e| e.to_string())?;
     if let Err(e) = std::fs::rename(

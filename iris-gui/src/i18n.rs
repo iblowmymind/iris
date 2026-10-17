@@ -311,11 +311,14 @@ mod tests {
             let src = std::fs::read_to_string(&f).unwrap();
             let name = f.file_name().unwrap().to_string_lossy().into_owned();
             let mut rest = src.as_str();
-            while let Some(at) = rest.find("t!(\"") {
+            while let Some(at) = rest.find("t!(") {
                 // Skip identifiers that merely end in `t` (`print!`, `assert!`).
                 let prev = rest[..at].chars().next_back();
-                rest = &rest[at + 4..];
+                rest = &rest[at + 3..];
                 if prev.is_some_and(|c| c.is_alphanumeric() || c == '_') { continue; }
+                // The id may start on the next line.
+                let Some(after) = rest.trim_start().strip_prefix('"') else { continue };
+                rest = after;
                 let end = rest.find('"').unwrap();
                 let id = rest[..end].to_string();
                 // Argument names up to the matching close paren.

@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
+use crate::i18n::{subtitle, ResponseExt};
 use crate::ram::ram_presets;
 
 /// "New machine" startup dialog.
@@ -93,21 +94,21 @@ impl NewMachineDialog {
     pub fn show(&mut self, ctx: &egui::Context, prefs: &crate::settings::GuiSettings) {
         if !self.open { return; }
         let mut close = false;
-        egui::Window::new("New machine")
+        egui::Window::new(t!("dialog-new-machine-title"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(440.0);
-                ui.label(RichText::new("Configure a new SGI machine").strong());
+                subtitle(ui, t!("dialog-new-machine-subtitle"));
                 ui.add_space(4.0);
 
                 Grid::new("new_machine_grid").num_columns(2).striped(true).show(ui, |ui| {
-                    ui.label("Name");
+                    ui.label(t!("dialog-new-machine-name"));
                     ui.add(TextEdit::singleline(&mut self.name).desired_width(200.0));
                     ui.end_row();
 
-                    ui.label("Machine model");
+                    ui.label(t!("dialog-new-machine-model"));
                     let profile_before = self.profile;
                     ComboBox::from_id_salt("nm_profile")
                         .selected_text(self.profile.label())
@@ -135,7 +136,7 @@ impl NewMachineDialog {
                     }
                     ui.end_row();
 
-                    ui.label("Processor");
+                    ui.label(t!("dialog-new-machine-cpu"));
                     ComboBox::from_id_salt("nm_cpu")
                         .selected_text(self.cpu.label())
                         .show_ui(ui, |ui| {
@@ -145,7 +146,7 @@ impl NewMachineDialog {
                         });
                     ui.end_row();
 
-                    ui.label("Display resolution");
+                    ui.label(t!("dialog-new-machine-resolution"));
                     ComboBox::from_id_salt("nm_resolution")
                         .selected_text(self.resolution.label())
                         .show_ui(ui, |ui| {
@@ -155,16 +156,16 @@ impl NewMachineDialog {
                         });
                     ui.end_row();
 
-                    ui.label("PROM image");
+                    ui.label(t!("dialog-new-machine-prom"));
                     ui.horizontal(|ui| {
                         ui.add_enabled(!self.use_embedded_prom,
                             TextEdit::singleline(&mut self.prom_path).desired_width(260.0));
                         if ui.add_enabled(!self.use_embedded_prom, egui::Button::new("📁")).clicked() {
                             if let Some(p) = crate::filedialog::dialog_with_base(
-                                "PROM image", &self.prom_path, &self.machine_dir(prefs),
+                                &t!("dialog-new-machine-prom-picker"), &self.prom_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Data,
                                 crate::filedialog::Purpose::Open,
-                                &[("PROM image", &["bin"])]).pick_file()
+                                &[(t!("dialog-new-machine-prom-filter").as_str(), &["bin"])]).pick_file()
                             {
                                 self.prom_path = p.to_string_lossy().into_owned();
                             }
@@ -172,18 +173,18 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut self.use_embedded_prom, "Use embedded PROM (bundled with iris)");
+                    ui.checkbox(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom"));
                     ui.end_row();
 
-                    ui.label("NVRAM file");
+                    ui.label(t!("dialog-new-machine-nvram"));
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.nvram_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
                             if let Some(p) = crate::filedialog::dialog_with_base(
-                                "NVRAM file", &self.nvram_path, &self.machine_dir(prefs),
+                                &t!("dialog-new-machine-nvram-picker"), &self.nvram_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Data,
                                 crate::filedialog::Purpose::Save,
-                                &[("NVRAM", &["bin"])]).save_file()
+                                &[(t!("dialog-new-machine-nvram-filter").as_str(), &["bin"])]).save_file()
                             {
                                 self.nvram_path = p.to_string_lossy().into_owned();
                             }
@@ -191,16 +192,16 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
 
-                    ui.label("NVRAM EEPROM file")
-                        .on_hover_text("Indigo2/IP28's motherboard EEPROM — eaddr and PROM env live here, not in NVRAM above.");
+                    ui.label(t!("dialog-new-machine-eeprom"))
+                        .tip(t!("dialog-new-machine-eeprom-tip"));
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.nveeprom_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
                             if let Some(p) = crate::filedialog::dialog_with_base(
-                                "NVRAM EEPROM file", &self.nveeprom_path, &self.machine_dir(prefs),
+                                &t!("dialog-new-machine-eeprom-picker"), &self.nveeprom_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Data,
                                 crate::filedialog::Purpose::Save,
-                                &[("NVRAM EEPROM", &["bin"])]).save_file()
+                                &[(t!("dialog-new-machine-eeprom-filter").as_str(), &["bin"])]).save_file()
                             {
                                 self.nveeprom_path = p.to_string_lossy().into_owned();
                             }
@@ -209,67 +210,62 @@ impl NewMachineDialog {
                     ui.end_row();
 
                     if !self.ram_advanced {
-                        ui.label("Total RAM");
+                        ui.label(t!("dialog-new-machine-ram"));
                         ComboBox::from_id_salt("ram_total")
-                            .selected_text(format!("{} MB", self.ram_total_mb))
+                            .selected_text(t!("dialog-new-machine-mb", size = self.ram_total_mb))
                             .show_ui(ui, |ui| {
                                 for &s in ram_presets(self.profile.ip28()) {
-                                    ui.selectable_value(&mut self.ram_total_mb, s, format!("{s} MB"));
+                                    ui.selectable_value(&mut self.ram_total_mb, s, t!("dialog-new-machine-mb", size = s));
                                 }
                             });
                         ui.end_row();
                     } else {
                         let ip28_banks = self.profile.ip28();
                         for i in 0..4 {
-                            ui.label(format!("Bank {i}"));
+                            ui.label(t!("dialog-new-machine-bank", bank = i));
                             ComboBox::from_id_salt(("nm_bank", i))
-                                .selected_text(format!("{} MB", self.ram_banks[i]))
+                                .selected_text(t!("dialog-new-machine-mb", size = self.ram_banks[i]))
                                 .show_ui(ui, |ui| {
                                     for &sz in VALID_BANK_SIZES {
                                         ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
-                                            ui.selectable_value(&mut self.ram_banks[i], sz, format!("{sz} MB"))
-                                                .on_disabled_hover_text("256/512 MB banks need the IP28 machine profile");
+                                            ui.selectable_value(&mut self.ram_banks[i], sz, t!("dialog-new-machine-mb", size = sz))
+                                                .on_disabled_hover_text(t!("dialog-new-machine-bank-ip28-only"));
                                         });
                                     }
                                 });
                             ui.end_row();
                         }
                         let total: u32 = self.ram_banks.iter().sum();
-                        ui.label("Total");
-                        ui.label(format!("{total} MB"));
+                        ui.label(t!("dialog-new-machine-ram-total"));
+                        ui.label(t!("dialog-new-machine-mb", size = total));
                         ui.end_row();
                     }
                     ui.label("");
-                    ui.checkbox(&mut self.ram_advanced, "Advanced: configure individual banks");
+                    ui.checkbox(&mut self.ram_advanced, t!("dialog-new-machine-ram-banks"));
                     ui.end_row();
                 });
 
                 if self.profile == MachineProfile::Indigo2Ip28 {
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(
-                            "Bring-up. The new machine is set up with IMPACT graphics — the \
-                             IP28 IRIX kernel has no Newport driver at all; change it from the \
-                             General tab after creation if needed. The embedded IP28 PROM \
-                             is used when no external PROM file is available.",
-                        )
+                        RichText::new(t!("dialog-new-machine-ip28-note"))
                         .color(Color32::from_rgb(220, 170, 90))
                         .small(),
                     );
                 }
 
                 ui.separator();
-                ui.label(RichText::new("Boot disk (optional)").strong());
+                ui.label(RichText::new(t!("dialog-new-machine-disks")).strong());
                 Grid::new("new_machine_disk").num_columns(2).striped(true).show(ui, |ui| {
-                    ui.label("SCSI ID 1 (HDD)");
+                    ui.label(t!("dialog-new-machine-hdd"));
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.scsi1_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
                             if let Some(p) = crate::filedialog::dialog_with_base(
-                                "Hard disk image", &self.scsi1_path, &self.machine_dir(prefs),
+                                &t!("dialog-new-machine-hdd-picker"), &self.scsi1_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Disks,
                                 crate::filedialog::Purpose::Open,
-                                &[("Disk image", &["raw", "img", "chd"])]).pick_file()
+                                &[(t!("dialog-new-machine-hdd-filter").as_str(), &["raw", "img", "chd"])]).pick_file()
                             {
                                 self.scsi1_path = p.to_string_lossy().into_owned();
                                 self.create_blank_scsi1 = false;
@@ -278,19 +274,19 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut self.create_blank_scsi1,
-                        "If the file doesn't exist, treat as empty (suitable for fresh IRIX install)");
+                    ui.checkbox(&mut self.create_blank_scsi1, t!("dialog-new-machine-hdd-blank"));
                     ui.end_row();
 
-                    ui.label("SCSI ID 4 (CD-ROM)");
+                    ui.label(t!("dialog-new-machine-cdrom"));
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.cdrom4_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
                             if let Some(p) = crate::filedialog::dialog_with_base(
-                                "CD-ROM image", &self.cdrom4_path, &self.machine_dir(prefs),
+                                &t!("dialog-new-machine-cdrom-picker"), &self.cdrom4_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Disks,
                                 crate::filedialog::Purpose::Open,
-                                &[("ISO", &["iso"]), ("CD image", &["iso", "chd"])]).pick_file()
+                                &[(t!("dialog-new-machine-iso-filter").as_str(), &["iso"]),
+                                  (t!("dialog-new-machine-cd-filter").as_str(), &["iso", "chd"])]).pick_file()
                             {
                                 self.cdrom4_path = p.to_string_lossy().into_owned();
                                 self.attach_cdrom = true;
@@ -299,22 +295,20 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut self.attach_cdrom, "Attach an install CD-ROM at SCSI ID 4");
+                    ui.checkbox(&mut self.attach_cdrom, t!("dialog-new-machine-cdrom-attach"));
                     ui.end_row();
                 });
 
                 ui.separator();
-                ui.label(RichText::new(
-                    "You can refine networking, JIT, video-in and CI settings from the menus after creation."
-                ).color(Color32::GRAY).small());
+                subtitle(ui, t!("dialog-new-machine-footer-subtitle"));
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() { close = true; }
+                    if ui.button(t!("common-cancel")).clicked() { close = true; }
                     let name = if self.name.trim().is_empty() { "indy" } else { self.name.trim() };
                     let valid = crate::machines::validate_name(name);
                     if let Err(e) = &valid { ui.colored_label(Color32::from_rgb(230, 140, 70), e); }
-                    if ui.add_enabled(valid.is_ok(), egui::Button::new(RichText::new("Create").strong())
+                    if ui.add_enabled(valid.is_ok(), egui::Button::new(RichText::new(t!("dialog-new-machine-create")).strong())
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         let mut cfg = MachineConfig::default();

@@ -36,8 +36,8 @@ pub fn enable_packet_capture() -> EnableOutcome {
 
 /// One-line, platform-specific hint shown next to the PCAP warning, describing
 /// how capture permission is obtained on this OS.
-pub fn permission_hint() -> &'static str {
-    imp::HINT
+pub fn permission_hint() -> String {
+    imp::hint()
 }
 
 #[cfg(target_os = "linux")]
@@ -61,8 +61,9 @@ mod imp {
     use std::path::PathBuf;
     use std::process::Command;
 
-    pub const HINT: &str =
-        "Linux: packages grant capture via setcap automatically; AppImage/portable relaunches with pkexec.";
+    pub fn hint() -> String {
+        t!("capture-hint-linux")
+    }
 
     pub fn enable() -> EnableOutcome {
         // On success `exec` replaces this process and never returns; any return is
@@ -82,18 +83,13 @@ mod imp {
             Some(p) => PathBuf::from(p),
             None => match std::env::current_exe() {
                 Ok(p) => p,
-                Err(e) => return format!("couldn't find the IRIS executable: {e}"),
+                Err(e) => return t!("capture-error-no-exe", error = e.to_string()),
             },
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
 
         if which_pkexec().is_none() {
-            return format!(
-                "pkexec not found. Install polkit (policykit-1), or grant capture \
-                 capability manually:\n\n    \
-                 sudo setcap cap_net_raw,cap_net_admin+eip {}",
-                target.display()
-            );
+            return t!("capture-error-no-pkexec", path = target.display());
         }
 
         // pkexec strips the environment: re-inject display + identity vars so the
@@ -124,7 +120,7 @@ mod imp {
             .arg(&target)
             .args(&args)
             .exec();
-        format!("failed to relaunch with pkexec: {err}")
+        t!("capture-error-pkexec", error = err.to_string())
     }
 
     fn which_pkexec() -> Option<PathBuf> {
@@ -154,8 +150,9 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    pub const HINT: &str =
-        "macOS: a one-time admin install (ChmodBPF) makes /dev/bpf* readable, then quit & reopen IRIS.";
+    pub fn hint() -> String {
+        t!("capture-hint-macos")
+    }
 
     /// The daemon helper resources, baked into the binary from the repo so the
     /// flow needs no .app bundle layout at runtime.
@@ -174,23 +171,21 @@ mod imp {
         }
         let user = match std::env::var("USER") {
             Ok(u) if !u.is_empty() && u != "root" => u,
-            _ => return EnableOutcome::Failed(
-                "couldn't determine the current macOS user to grant capture access".into()),
+            _ => return EnableOutcome::Failed(t!("capture-error-no-user")),
         };
         let staged = match stage_resources() {
             Ok(s) => s,
-            Err(e) => return EnableOutcome::Failed(format!("couldn't stage ChmodBPF resources: {e}")),
+            Err(e) => return EnableOutcome::Failed(t!("capture-error-stage", error = e.to_string())),
         };
         let script_path = staged.dir.join("install.sh");
         if let Err(e) = std::fs::write(&script_path, install_script(&staged, &user)) {
-            return EnableOutcome::Failed(format!("couldn't write install script: {e}"));
+            return EnableOutcome::Failed(t!("capture-error-script", error = e.to_string()));
         }
         match run_admin_shell(&script_path) {
-            AdminResult::Ok => EnableOutcome::NeedsRelaunch(
-                "Packet capture enabled. Quit and reopen IRIS so the new group \
-                 membership takes effect, then start the machine again.".into()),
+            // The new group membership only applies to processes started afterwards.
+            AdminResult::Ok => EnableOutcome::NeedsRelaunch(t!("capture-enabled-relaunch")),
             AdminResult::Cancelled => EnableOutcome::Cancelled,
-            AdminResult::Failed(e) => EnableOutcome::Failed(format!("ChmodBPF install failed: {e}")),
+            AdminResult::Failed(e) => EnableOutcome::Failed(t!("capture-error-install", error = e)),
         }
     }
 
@@ -289,7 +284,7 @@ mod imp {
                     AdminResult::Failed(err.trim().to_string())
                 }
             }
-            Err(e) => AdminResult::Failed(format!("couldn't run osascript: {e}")),
+            Err(e) => AdminResult::Failed(t!("capture-error-osascript", error = e.to_string())),
         }
     }
 }
@@ -299,8 +294,9 @@ mod imp {
     use super::EnableOutcome;
     use std::process::Command;
 
-    pub const HINT: &str =
-        "Windows: needs the Npcap driver + Administrator. The button opens the download page.";
+    pub fn hint() -> String {
+        t!("capture-hint-windows")
+    }
 
     /// Whether a WinPcap-compatible driver (Npcap, or legacy WinPcap) is present.
     fn npcap_present() -> bool {
@@ -313,22 +309,14 @@ mod imp {
         // Check first: if the driver is already present, the only remaining
         // requirement is Administrator.
         if npcap_present() {
-            return EnableOutcome::NeedsRelaunch(
-                "Npcap is installed. PCAP capture also needs Administrator — relaunch IRIS as \
-                 Administrator, then start the machine again."
-                    .into(),
-            );
+            return EnableOutcome::NeedsRelaunch(t!("capture-npcap-installed"));
         }
         // We never bundle or silently download the driver. Open the official page
         // so the user installs Npcap themselves, then relaunches and tries again.
         let _ = Command::new("explorer")
             .arg("https://npcap.com/#download")
             .spawn();
-        EnableOutcome::NeedsRelaunch(
-            "Opened the Npcap download page in your browser. Install Npcap (a free \
-             WinPcap-compatible driver), then relaunch IRIS as Administrator and try again."
-                .into(),
-        )
+        EnableOutcome::NeedsRelaunch(t!("capture-npcap-download"))
     }
 }
 
@@ -336,8 +324,10 @@ mod imp {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod imp {
     use super::EnableOutcome;
-    pub const HINT: &str = "PCAP capture requires elevated privileges on this platform.";
+    pub fn hint() -> String {
+        t!("capture-hint-other")
+    }
     pub fn enable() -> EnableOutcome {
-        EnableOutcome::Failed("Packet capture isn't supported on this platform.".into())
+        EnableOutcome::Failed(t!("capture-unsupported"))
     }
 }

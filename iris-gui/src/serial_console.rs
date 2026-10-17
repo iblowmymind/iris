@@ -110,16 +110,15 @@ fn run(addr: SocketAddr, shared: Arc<Mutex<Shared>>, running: Arc<AtomicBool>, w
     let stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
         Ok(s) => s,
         Err(e) => {
-            shared.lock().error = Some(format!(
-                "could not connect to {addr}: {e}\nStart the emulator first, then reopen."
-            ));
+            shared.lock().error = Some(t!("serial-connect-failed",
+                addr = addr.to_string(), error = e.to_string()));
             return;
         }
     };
     let wclone = match stream.try_clone() {
         Ok(c) => c,
         Err(e) => {
-            shared.lock().error = Some(format!("socket clone failed: {e}"));
+            shared.lock().error = Some(t!("serial-socket-failed", error = e.to_string()));
             return;
         }
     };
