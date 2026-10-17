@@ -16,5 +16,5 @@ pub fn active_banks(banks: &[u32; 4]) -> usize {
 pub fn ram_summary(banks: &[u32; 4]) -> String {
     let total: u32 = banks.iter().sum();
     let n = active_banks(banks);
-    format!("{total} MB ({n} bank{})", if n == 1 { "" } else { "s" })
+    t!("ram-summary", total = total, banks = n)
 }

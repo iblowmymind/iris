@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::i18n::{subtitle, ResponseExt};
 use eframe::egui::{self, Color32, RichText, ScrollArea, Ui};
 use iris::bench_report::{fmt_rate, ReferenceEntry, ReferenceTable, Run, CATEGORIES};
 use iris::bench_runner::{self, BenchOptions, Progress};
@@ -31,7 +32,7 @@ use iris::bench_runner::{self, BenchOptions, Progress};
 const MAX_LINES: usize = 4000;
 
 /// What the two modes cost on a plain interpreter build, for the button's
-/// hover text. Measured on the reference host — treated as an order of
+/// tooltip. Measured on the reference host — treated as an order of
 /// magnitude, not a promise, which is why the UI also shows real elapsed time.
 const QUICK_SECS: u64 = 35;
 const FULL_SECS: u64 = 60;
@@ -173,13 +174,8 @@ impl BenchState {
 pub fn show(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
     st.poll();
 
-    ui.heading("Benchmark");
-    ui.label(
-        "Measures how fast this build of IRIS emulates an Indy on this machine, and \
-         checks that it is still computing the right answers. Everything it needs is \
-         built in — no disk image, no IRIX, nothing downloaded, and nothing sent \
-         anywhere.",
-    );
+    ui.heading(t!("bench-heading"));
+    subtitle(ui, t!("bench-subtitle"));
     ui.add_space(8.0);
 
     controls(ui, st, machine_running);
@@ -201,9 +197,9 @@ pub fn show(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
         Some(Err(e)) => {
             ui.add_space(8.0);
             if e == "stopped" {
-                ui.label(RichText::new("Stopped.").weak());
+                ui.label(RichText::new(t!("bench-stopped")).weak());
             } else {
-                ui.label(RichText::new(format!("The benchmark did not finish: {e}"))
+                ui.label(RichText::new(t!("bench-failed", error = &e))
                     .color(Color32::from_rgb(220, 170, 90)));
             }
             st.last = Some(Err(e));
@@ -229,7 +225,7 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
             let secs = if st.quick { QUICK_SECS } else { FULL_SECS };
             if ui
                 .button(RichText::new(primary_label()).strong())
-                .on_hover_text(format!("About {secs} seconds. Runs entirely inside this app."))
+                .tip(t!("bench-run-tip", secs = secs))
                 .clicked()
             {
                 let (quick, cpu) = (st.quick, st.cpu);
@@ -249,24 +245,15 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
                     }
                 })
                 .response
-                .on_hover_text(
-                    "Which CPU to benchmark. R4400 is 16 KB direct-mapped L1s with a \
-                     secondary cache and MIPS III; R5000 is 2-way 32 KB L1s, no \
-                     secondary cache and MIPS IV. Scores are not comparable between them.",
-                );
+                .tip(t!("bench-cpu-tip"));
         });
 
         ui.add_enabled_ui(!busy, |ui| {
-            ui.checkbox(&mut st.quick, "Quick")
-                .on_hover_text(
-                    "Shorter timed runs and one pass per kernel instead of the best of \
-                     two. Every kernel still runs and still checks its answer, so the \
-                     accuracy score means exactly the same thing — only the speed \
-                     figures are a little noisier.",
-                );
+            ui.checkbox(&mut st.quick, t!("bench-quick"))
+                .tip(t!("bench-quick-tip"));
         });
 
-        if busy && ui.button("Stop").clicked() {
+        if busy && ui.button(t!("bench-stop")).clicked() {
             st.stop();
         }
     });
@@ -274,7 +261,7 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
     if machine_running && !busy {
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Stop the emulator first — a benchmark run needs the machine to itself.")
+            RichText::new(t!("bench-machine-running"))
                 .weak(),
         );
     }
@@ -283,8 +270,7 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
 fn primary_label() -> String {
     // Name the machine the way its owner does. This measures the emulator, but
     // what varies between users is the hardware under it.
-    let what = if cfg!(target_os = "macos") { "this Mac" } else { "this PC" };
-    format!("Benchmark {what}")
+    if cfg!(target_os = "macos") { t!("bench-run-mac") } else { t!("bench-run-pc") }
 }
 
 fn running_view(ui: &mut Ui, live: &Live) {
@@ -294,9 +280,9 @@ fn running_view(ui: &mut Ui, live: &Live) {
     ui.add(egui::ProgressBar::new(st.fraction()).show_percentage().animate(true));
     ui.horizontal(|ui| {
         ui.label(if st.current.is_empty() {
-            "Starting the emulated machine…".to_string()
+            t!("bench-starting")
         } else {
-            format!("{}  ({} of {})", st.current, st.done, st.total)
+            t!("bench-progress", kernel = &st.current, done = st.done, total = st.total)
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(remaining(&st, elapsed, live.quick)).weak());
@@ -318,17 +304,17 @@ fn remaining(st: &LiveState, elapsed: Duration, quick: bool) -> String {
     let e = elapsed.as_secs();
     if st.done < 4 || st.total == 0 {
         let guess = if quick { QUICK_SECS } else { FULL_SECS };
-        return format!("{e}s elapsed · about {guess}s in total");
+        return t!("bench-time-total", elapsed = e, total = guess);
     }
     let per = elapsed.as_secs_f64() / st.done as f64;
     let left = (per * (st.total - st.done) as f64).round() as u64;
-    format!("{e}s elapsed · about {left}s left")
+    t!("bench-time-left", elapsed = e, left = left)
 }
 
 // ─── results ─────────────────────────────────────────────────────────────────
 
 fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
-    ui.heading("Results");
+    ui.heading(t!("bench-results"));
     ui.add_space(4.0);
 
     // The three figures that stand on their own. DMIPS has forty years of
@@ -336,18 +322,17 @@ fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
     // and accuracy needs no comparison at all — which is why an empty reference
     // table costs the reader so little.
     egui::Grid::new("bench_headline").num_columns(3).spacing([18.0, 6.0]).show(ui, |ui| {
-        headline(ui, "Emulated Indy", &format!("{:.0} DMIPS", run.dmips().unwrap_or(0.0)),
-                 "Dhrystone 2.1, the figure every published workstation benchmark since \
-                  1988 uses. A real 150 MHz Indy scored about 130.");
+        headline(ui, &t!("bench-dmips"),
+                 &t!("bench-dmips-value", value = format!("{:.0}", run.dmips().unwrap_or(0.0))),
+                 t!("bench-dmips-tip"));
         ui.end_row();
-        headline(ui, "Emulator throughput", &format!("{:.0} MIPS", run.mips()),
-                 "Guest instructions retired per second of host time.");
+        headline(ui, &t!("bench-mips"), &t!("bench-mips-value", value = format!("{:.0}", run.mips())),
+                 t!("bench-mips-tip"));
         ui.end_row();
-        headline(ui, "Accuracy",
-                 &format!("{:.0}%  ({}/{})", run.accuracy(), run.matched, run.checked),
-                 "Share of kernels whose result matched a checksum computed independently \
-                  by building the same C natively. Anything below 100% is a real emulator \
-                  bug and worth reporting.");
+        headline(ui, &t!("bench-accuracy"),
+                 &t!("bench-accuracy-value", percent = format!("{:.0}", run.accuracy()),
+                     matched = run.matched, checked = run.checked),
+                 t!("bench-accuracy-tip"));
         ui.end_row();
     });
 
@@ -361,7 +346,7 @@ fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
                 ui.label(RichText::new(format!("{}{}", fmt_rate(rate), c.suffix)).monospace());
                 match reference.and_then(|r| ratio(run, r, c.label)) {
                     Some((ratio, label)) => {
-                        ui.label(RichText::new(format!("{ratio:.2}× vs {label}")).weak());
+                        ui.label(RichText::new(t!("bench-ratio", ratio = format!("{ratio:.2}"), reference = label)).weak());
                     }
                     None => { ui.label(""); }
                 }
@@ -372,7 +357,7 @@ fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
     ui.add_space(8.0);
     if reference.is_none() {
         ui.label(
-            RichText::new("Reference statistics not gathered for this platform.").weak(),
+            RichText::new(t!("bench-no-reference")).weak(),
         );
     }
     caveats(ui, run);
@@ -382,10 +367,10 @@ fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button("Copy").clicked() {
+        if ui.button(t!("common-copy")).clicked() {
             ui.ctx().copy_text(report_text(run));
         }
-        if ui.button("Save report…").clicked() {
+        if ui.button(t!("bench-save-report")).clicked() {
             save_report(run);
         }
     });
@@ -403,7 +388,7 @@ fn results_view(ui: &mut Ui, run: &Run, reference: Option<&ReferenceEntry>) {
 /// the numbers above comparable with anything.
 fn machine_view(ui: &mut Ui, run: &Run) {
     let m = &run.machine;
-    egui::CollapsingHeader::new("Machine measured").default_open(false).show(ui, |ui| {
+    egui::CollapsingHeader::new(t!("bench-machine")).default_open(false).show(ui, |ui| {
         egui::Grid::new("bench_machine").num_columns(2).spacing([18.0, 4.0]).striped(true)
             .show(ui, |ui| {
                 let mut row = |k: &str, v: String| {
@@ -412,47 +397,54 @@ fn machine_view(ui: &mut Ui, run: &Run) {
                     ui.end_row();
                 };
 
-                let rev = if m.rev.is_empty() { String::new() } else { format!(" rev {}", m.rev) };
-                row("CPU", format!("{}{}  ({})", m.cpu, rev, m.prid));
+                row(&t!("bench-machine-cpu"), if m.rev.is_empty() {
+                    t!("bench-machine-cpu-value", cpu = &m.cpu, prid = &m.prid)
+                } else {
+                    t!("bench-machine-cpu-rev-value", cpu = &m.cpu, rev = &m.rev, prid = &m.prid)
+                });
 
                 if !m.cache.is_empty() {
                     let c = &m.cache;
-                    row("L1 cache", format!(
-                        "{} I ({} B lines) / {} D ({} B lines)",
-                        fmt_bytes(c.l1i_bytes), c.l1i_line,
-                        fmt_bytes(c.l1d_bytes), c.l1d_line));
-                    row("L2 cache", if !c.l2_present {
-                        "absent".to_string()
+                    row(&t!("bench-machine-l1"), t!("bench-machine-l1-value",
+                        icache = fmt_bytes(c.l1i_bytes), iline = c.l1i_line,
+                        dcache = fmt_bytes(c.l1d_bytes), dline = c.l1d_line));
+                    row(&t!("bench-machine-l2"), if !c.l2_present {
+                        t!("bench-machine-l2-absent")
                     } else if c.l2_bytes > 0 {
-                        format!("{}, {} B lines", fmt_bytes(c.l2_bytes), c.l2_line)
+                        t!("bench-machine-l2-value", size = fmt_bytes(c.l2_bytes), line = c.l2_line)
                     } else {
                         // The architecture does not expose the size on anything
                         // but a Triton; the PROM reads it from the EEPROM.
-                        format!("present, {} B lines, size not reported", c.l2_line)
+                        t!("bench-machine-l2-unsized", line = c.l2_line)
                     });
                 }
 
                 if !m.memory.is_empty() {
                     let banks: Vec<String> = m.memory.banks.iter()
-                        .map(|b| format!("bank{} {} MB @ {:#010x}", b.index, b.mb, b.base))
+                        .map(|b| t!("bench-machine-bank", index = b.index, size = b.mb,
+                                    base = format!("{:#010x}", b.base)))
                         .collect();
-                    row("Memory", format!("{} MB   {}", m.memory.total_mb, banks.join("  ")));
+                    row(&t!("bench-machine-memory"), t!("bench-machine-memory-value",
+                        total = m.memory.total_mb, banks = banks.join("  ")));
                 }
 
-                if !m.sysid.is_empty() { row("Board", format!("SYSID {}", m.sysid)); }
-                row("Emulator", if run.features.is_empty() {
-                    "no optional features".to_string()
+                if !m.sysid.is_empty() {
+                    row(&t!("bench-machine-board"), t!("bench-machine-board-value", sysid = &m.sysid));
+                }
+                row(&t!("bench-machine-emulator"), if run.features.is_empty() {
+                    t!("bench-machine-no-features")
                 } else {
                     run.features.join(" ")
                 });
-                row("Host", format!("{} · {} {} · {} cores",
-                                    m_host(run), run.host.os, run.host.arch, run.host.cores));
+                row(&t!("bench-machine-host"), t!("bench-machine-host-value",
+                    cpu = m_host(run), os = &run.host.os, arch = &run.host.arch,
+                    cores = run.host.cores));
             });
     });
 }
 
-fn m_host(run: &Run) -> &str {
-    if run.host.cpu_model.is_empty() { "unknown CPU" } else { &run.host.cpu_model }
+fn m_host(run: &Run) -> String {
+    if run.host.cpu_model.is_empty() { t!("bench-machine-unknown-cpu") } else { run.host.cpu_model.clone() }
 }
 
 /// KB under a megabyte, MB above — the way a person reads a cache size.
@@ -462,10 +454,10 @@ fn fmt_bytes(n: u64) -> String {
     else { format!("{} B", n) }
 }
 
-fn headline(ui: &mut Ui, label: &str, value: &str, help: &str) {
+fn headline(ui: &mut Ui, label: &str, value: &str, help: String) {
     ui.label(label);
     ui.label(RichText::new(value).size(18.0).strong());
-    ui.label(RichText::new("?").weak()).on_hover_text(help);
+    ui.label(RichText::new("?").weak()).tip(help);
 }
 
 /// This run's category rate over the reference row's, when the row carries
@@ -495,13 +487,11 @@ fn ratio(run: &Run, reference: &ReferenceEntry, category: &str) -> Option<(f64, 
 /// numbers above, said plainly rather than left for them to discover.
 fn caveats(ui: &mut Ui, run: &Run) {
     if let Some(why) = run.settings.shortened_because() {
-        ui.label(RichText::new(format!("Quick run — {why}. Accuracy is unaffected."))
+        ui.label(RichText::new(t!("bench-caveat-quick", reason = why))
             .weak());
     }
     if !run.features.iter().any(|f| f == "jitv2") {
-        ui.label(RichText::new(
-            "This build runs the interpreter. A build with the MIPS JIT scores roughly \
-             four times higher, and is not comparable with these numbers.").weak());
+        ui.label(RichText::new(t!("bench-caveat-interpreter")).weak());
     }
     let unexpected: Vec<&str> = run.rows.iter()
         .filter(|r| r.exc > 0 && !iris::bench_report::EXPECT_EXC.contains(&r.name.as_str()))
@@ -510,9 +500,7 @@ fn caveats(ui: &mut Ui, run: &Run) {
     if !unexpected.is_empty() {
         // A kernel that faults is stepped over by the harness and still reports
         // a throughput — for doing something other than what it claims.
-        ui.label(RichText::new(format!(
-            "Took unexpected exceptions in {} — those figures are not trustworthy.",
-            unexpected.join(", ")))
+        ui.label(RichText::new(t!("bench-caveat-exceptions", kernels = unexpected.join(", ")))
             .color(Color32::from_rgb(220, 170, 90)));
     }
 }
@@ -527,7 +515,7 @@ fn details(ui: &mut Ui, st: &mut BenchState) {
     }
 
     ui.add_space(8.0);
-    egui::CollapsingHeader::new("Details")
+    egui::CollapsingHeader::new(t!("bench-details"))
         .default_open(false)
         .show(ui, |ui| {
             // The guest's own console, which is where the per-kernel table and
@@ -544,13 +532,13 @@ fn details(ui: &mut Ui, st: &mut BenchState) {
                         Some(b) => {
                             let v = b.lock().unwrap();
                             if v.is_empty() {
-                                ui.label(RichText::new("(nothing yet)").weak());
+                                ui.label(RichText::new(t!("bench-details-empty")).weak());
                             }
                             for l in v.iter() {
                                 ui.label(RichText::new(l).monospace().size(11.0));
                             }
                         }
-                        None => { ui.label(RichText::new("(nothing yet)").weak()); }
+                        None => { ui.label(RichText::new(t!("bench-details-empty")).weak()); }
                     }
                 });
         });
@@ -610,8 +598,8 @@ fn save_report(run: &Run) {
     // app's own container is one the user picked. Nothing is uploaded.
     let name = format!("iris-benchmark-{}.json", run.cell.replace(['/', ' '], "-"));
     let Some(path) = crate::filedialog::dialog_with(
-        "Save benchmark report", &name, crate::filedialog::Anchor::Data,
-        crate::filedialog::Purpose::Save, &[("JSON", &["json"])]).save_file()
+        &t!("bench-save-report-picker"), &name, crate::filedialog::Anchor::Data,
+        crate::filedialog::Purpose::Save, &[(t!("bench-save-report-filter").as_str(), &["json"])]).save_file()
     else {
         return;
     };
@@ -662,38 +650,33 @@ impl DevRunner {
 fn developer_tools(ui: &mut Ui, st: &mut BenchState) {
     ui.add_space(12.0);
     ui.separator();
-    egui::CollapsingHeader::new("Developer tools").default_open(false).show(ui, |ui| {
-        ui.label(RichText::new(
-            "These shell out to iris-bench and need a source checkout. The matrix builds \
-             one emulator per cell — the CPU model and the JIT are compile-time features, \
-             so comparing them means comparing binaries.").weak());
+    egui::CollapsingHeader::new(t!("bench-dev")).default_open(false).show(ui, |ui| {
+        subtitle(ui, t!("bench-dev-subtitle"));
         ui.add_space(6.0);
 
         let busy = st.is_running();
         let have_bin = dev::iris_bench_bin();
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy && have_bin.is_some(), |ui| {
-                if ui.button("Full matrix")
-                    .on_hover_text("R4400 and R5000, interpreter and jitv2. Tens of minutes, \
-                                    and it needs cargo on PATH.")
+                if ui.button(t!("bench-dev-matrix"))
+                    .tip(t!("bench-dev-matrix-tip"))
                     .clicked()
                 {
                     st.dev.inner.start("matrix", &["matrix"]);
                 }
-                if ui.button("Measure this host")
-                    .on_hover_text("The identical kernels compiled natively, for the ratio \
-                                    between emulated and native.")
+                if ui.button(t!("bench-dev-host"))
+                    .tip(t!("bench-dev-host-tip"))
                     .clicked()
                 {
                     st.dev.inner.start("host", &["host"]);
                 }
             });
             if have_bin.is_none() {
-                ui.label(RichText::new("iris-bench not built — cargo build --release --bin iris-bench")
+                ui.label(RichText::new(t!("bench-dev-not-built"))
                     .color(Color32::from_rgb(220, 170, 90)));
             }
             if let Some(dir) = dev::results_dir() {
-                if !busy && ui.button("Open results").clicked() { dev::open_folder(&dir); }
+                if !busy && ui.button(t!("bench-dev-open-results")).clicked() { dev::open_folder(&dir); }
             }
         });
         if let Some(o) = st.dev.inner.last_outcome() {
@@ -755,7 +738,7 @@ mod dev {
                 let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(e) => {
-                        *outcome.lock().unwrap() = Some(format!("failed to start {}: {e}", bin.display()));
+                        *outcome.lock().unwrap() = Some(t!("bench-dev-start-failed", path = bin.display(), error = e.to_string()));
                         running.store(false, Ordering::Relaxed);
                         return;
                     }
@@ -787,8 +770,12 @@ mod dev {
                 *child_slot.lock().unwrap() = None;
 
                 let ok = matches!(status, Some(Ok(s)) if s.success());
-                *outcome.lock().unwrap() =
-                    Some(format!("{label} {}", if ok { "finished" } else { "failed" }));
+                *outcome.lock().unwrap() = Some(match (label.as_str(), ok) {
+                    ("matrix", true) => t!("bench-dev-matrix-finished"),
+                    ("matrix", false) => t!("bench-dev-matrix-failed"),
+                    (_, true) => t!("bench-dev-host-finished"),
+                    (_, false) => t!("bench-dev-host-failed"),
+                });
                 running.store(false, Ordering::Relaxed);
             });
         }
@@ -921,13 +908,14 @@ mod tests {
     fn the_time_estimate_waits_for_evidence_before_making_one() {
         let early = LiveState { total: 46, done: 2, current: "int/alu".into() };
         let s = remaining(&early, Duration::from_secs(3), true);
-        assert!(s.contains("in total"), "must not extrapolate from two rows: {s}");
-        assert!(!s.contains("left"));
+        assert_eq!(s, t!("bench-time-total", elapsed = 3u64, total = QUICK_SECS),
+                   "must not extrapolate from two rows");
 
         // Halfway through 40s of a 46-kernel run: about 40s more to go.
         let later = LiveState { total: 46, done: 23, current: "mem/copy".into() };
         let s = remaining(&later, Duration::from_secs(40), true);
-        assert!(s.contains("40s left"), "expected an estimate near 40s, got {s}");
+        assert_eq!(s, t!("bench-time-left", elapsed = 40u64, left = 40u64),
+                   "expected an estimate near 40s");
     }
 
     #[test]

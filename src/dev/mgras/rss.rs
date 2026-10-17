@@ -63,6 +63,11 @@ pub mod reg {
     /// Model-private: pixel transfers move stencil indices, the top byte
     /// of the ZST buffer (DRBpointers aimed at it); the depth stays.
     pub const ZST_STENCIL: u32 = 0x3F8;
+    /// Model-private: the window depth pixel transfers take, z.8 (the
+    /// current raster position's; our GE HLE loads it on
+    /// LOAD_RASTER_POS_INFO, which libGLcore sends before each
+    /// glDrawPixels / glCopyPixels draw: no depth crosses the bus).
+    pub const XFER_Z: u32 = 0x3F9;
     pub const FILLMODE: u32 = 0x110;
     pub const CONFIG: u32 = 0x112;
     pub const XYWIN: u32 = 0x115;
@@ -2252,11 +2257,32 @@ impl Rss {
         if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
             return;
         }
+        let (ux, uy) = (fx as u32, fy as u32);
+        if !self.depth_stencil(ux, uy, z) {
+            return;
+        }
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let b = self.target();
+        self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
+        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
+                }
+            }
+        }
+    }
+
+    /// The stencil and depth tests at framebuffer `(ux, uy)` for a
+    /// fragment at window depth `z` (z.12), updating the ZST buffer as
+    /// the stencil ops and the depth write mask say: whether the fragment
+    /// passes. True with both tests off.
+    fn depth_stencil(&mut self, ux: u32, uy: u32, z: i64) -> bool {
         let st = self.reg(reg::STENCILMODE);
         let zm = self.reg(reg::ZMODE);
         let (sten, ztest) = (st & TEST_ENABLE != 0, zm & ZMODE_TEST != 0);
         let zbuf = Buffer::new(ZST_PAGE, Kind::Wide, self.reg(reg::DRBSIZE));
-        let (ux, uy) = (fx as u32, fy as u32);
         if sten || ztest {
             let zst = self.mem.get(&zbuf, ux, uy);
             let s_old = ((zst >> 24) & 0xFF) as u32;
@@ -2288,21 +2314,9 @@ impl Rss {
             if new != zst {
                 self.mem.put(&zbuf, ux, uy, new);
             }
-            if !zpass {
-                return;
-            }
+            return zpass;
         }
-        let pp1 = self.reg(reg::PP1FILLMODE);
-        let b = self.target();
-        self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
-        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
-            if let Some(p) = self.second_buffer() {
-                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
-                if b2 != b {
-                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
-                }
-            }
-        }
+        true
     }
 
     /// A fragment's colour (12.16, clamped) blended or not, shifted down
@@ -2524,35 +2538,49 @@ impl Rss {
     }
 
     /// Whether transferred pixels go through the per-fragment stage, as
-    /// glDrawPixels' fragments do: RGB drawing with the alpha test or
-    /// blending on. Harbingers of Destiny draws its dialogue layer as a
-    /// window-sized RGBA image, transparent outside the box, under
-    /// glAlphaFunc(GL_GEQUAL, 0.9); written straight, the transparent
-    /// pixels covered the 3D scene in black. The depth and stencil tests
-    /// are not applied here: a transfer carries no depth.
+    /// glDrawPixels' fragments do: with the depth or stencil test on, or
+    /// (RGB drawing) the alpha test or blending. Harbingers of Destiny
+    /// draws its dialogue layer as a window-sized RGBA image, transparent
+    /// outside the box, under glAlphaFunc(GL_GEQUAL, 0.9); written
+    /// straight, the transparent pixels covered the 3D scene in black. The
+    /// fragments' depth is the raster position's (`reg::XFER_Z`).
     fn transfer_fragments(&self) -> bool {
         let pp1 = self.reg(reg::PP1FILLMODE);
-        self.rgb_mode()
-            && draw_buffer(pp1) != DRAW_CID
-            && (self.reg(reg::AFUNCMODE) & TEST_ENABLE != 0 || self.reg(reg::BLENDFACTOR) & BLEND_ENABLE != 0)
+        if draw_buffer(pp1) == DRAW_CID || draw_buffer(pp1) & 0x70 == 0x40 {
+            return false;
+        }
+        let zst = self.reg(reg::ZMODE) & ZMODE_TEST != 0 || self.reg(reg::STENCILMODE) & TEST_ENABLE != 0;
+        let rgb = self.rgb_mode()
+            && (self.reg(reg::AFUNCMODE) & TEST_ENABLE != 0 || self.reg(reg::BLENDFACTOR) & BLEND_ENABLE != 0);
+        zst || rgb
     }
 
     /// Transferred pixel `v` (a framebuffer value) at framebuffer `(fx,
-    /// fy)` through the alpha test and blending (`fragment_color`), into
-    /// the buffer or buffers drawing goes to. Without `alpha` the format
-    /// has none and the fragment's alpha is 1, as OpenGL gives it.
+    /// fy)` through the alpha test, the stencil and depth tests at the
+    /// raster position's depth, and blending (`fragment_color`), into the
+    /// buffer or buffers drawing goes to. Without `alpha` the format has
+    /// none and the fragment's alpha is 1, as OpenGL gives it. In colour
+    /// index `v` is the index (no alpha test, no blending).
     fn put_fragment(&mut self, fx: i32, fy: i32, v: u32, alpha: bool) {
         if !self.visible(fx, fy) {
             return;
         }
-        let v = if alpha { v } else { v | 0xFF << 24 };
-        let rgba = [0, 8, 16, 24].map(|s| (fixed::widen((v >> s) & 0xFF, 2) << 16) as i32);
+        let rgb = self.rgb_mode();
+        let rgba = if rgb {
+            let v = if alpha { v } else { v | 0xFF << 24 };
+            [0, 8, 16, 24].map(|s| (fixed::widen((v >> s) & 0xFF, 2) << 16) as i32)
+        } else {
+            [((v & 0xFFF) << 16) as i32, 0, 0, 0]
+        };
         let af = self.reg(reg::AFUNCMODE);
-        if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
+        if rgb && af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
+            return;
+        }
+        let (ux, uy) = (fx as u32, fy as u32);
+        if !self.depth_stencil(ux, uy, (self.reg(reg::XFER_Z) as i64) << 4) {
             return;
         }
         let pp1 = self.reg(reg::PP1FILLMODE);
-        let (ux, uy) = (fx as u32, fy as u32);
         let b = self.target();
         self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
         if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
@@ -3337,6 +3365,44 @@ mod tests {
         r.dma_write_line(0, &[0x80, 0xD0, 0xD0, 0xD0]);
         let c = px(&r, 7, 7) & 0xFF;
         assert!((0x8C..=0x94).contains(&c), "blend gave {c:#x}, want about 0x90");
+    }
+
+    /// glDrawPixels with the depth test: each pixel takes the raster
+    /// position's depth (XFER_Z), passes GL_LESS only over a farther
+    /// stored depth, and writes its depth through the depth write mask.
+    /// Colour index tests the same way.
+    #[test]
+    fn transfers_take_the_raster_depth() {
+        let mut r = x_server();
+        let zbuf = Buffer::new(ZST_PAGE, Kind::Wide, r.reg(reg::DRBSIZE));
+        let fy = (SCREEN_H - 1 - 7) as u32;
+        let zat = |r: &Rss, x: u32| r.mem.get(&zbuf, x, fy) & 0xFF_FFFF;
+        for (pp1, mask, near, far, a, b) in [
+            (0x0C00_6204u32, 0xFFFF_FFFFu32, 0x50_5050u32, 0x22_2222u32, [0xFF, 0x50, 0x50, 0x50], [0xFF, 0x22, 0x22, 0x22]),
+            (0x0C00_4404, 0xFFF, 0x123, 0x456, [0x01, 0x23, 0, 0], [0x04, 0x56, 0, 0]),
+        ] {
+            r.write(reg::PP1FILLMODE, pp1, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::ZMODE, 0, false);
+            r.write(reg::FILLMODE, 5 << 22, false);
+            r.write(reg::XFRMODE, if pp1 & 0x700 == 0x200 { 0x80 } else { 0x01 }, false);
+            r.write(reg::XFRSIZE, 1 << 16 | 2, false);
+            block(&mut r, 7, 7, 8, 7);
+            let line: Vec<u8> = if pp1 & 0x700 == 0x200 { [a, a].concat() } else { vec![a[0], a[1], a[0], a[1]] };
+            r.dma_write_line(0, &line);
+            assert_eq!(px(&r, 7, 7) & mask & 0xFF_FFFF, near, "{pp1:#x}: drawn with the test off");
+            // Stored depth 0.25 at x 7, 0.75 at x 8; raster depth 0.5, GL_LESS.
+            r.mem.put(&zbuf, 7, fy, 0x40_0000);
+            r.mem.put(&zbuf, 8, fy, 0xC0_0000);
+            r.write(reg::XFER_Z, 0x80_0000 << 8, false);
+            r.write(reg::ZMODE, 0xFF_FFFF << 4 | ZMODE_TEST | 1, false);
+            block(&mut r, 7, 7, 8, 7);
+            let line: Vec<u8> = if pp1 & 0x700 == 0x200 { [b, b].concat() } else { vec![b[0], b[1], b[0], b[1]] };
+            r.dma_write_line(0, &line);
+            assert_eq!(px(&r, 7, 7) & mask & 0xFF_FFFF, near, "{pp1:#x}: nearer stored depth kept");
+            assert_eq!(px(&r, 8, 7) & mask & 0xFF_FFFF, far, "{pp1:#x}: farther stored depth drawn over");
+            assert_eq!((zat(&r, 7), zat(&r, 8)), (0x40_0000, 0x80_0000), "{pp1:#x}: depth written where drawn");
+        }
     }
 
     #[test]

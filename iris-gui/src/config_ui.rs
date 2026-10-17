@@ -9,6 +9,7 @@ use iris::config::{AudioHost, CacheModel,
 use iris::net::nfsudp::NfsVersion;
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
+use crate::i18n::{subtitle, ResponseExt};
 use crate::ram::{ram_summary, ram_presets};
 
 /// Memory-tab context: whether the VM is running and what banks were last started with.
@@ -39,9 +40,9 @@ impl PcapIface {
     fn summary(&self) -> String {
         let mut s = self.name.clone();
         let mut tags = Vec::new();
-        if self.up { tags.push("up"); }
-        if self.running { tags.push("running"); }
-        if self.loopback { tags.push("loopback"); }
+        if self.up { tags.push(t!("config-pcap-tag-up")); }
+        if self.running { tags.push(t!("config-pcap-tag-running")); }
+        if self.loopback { tags.push(t!("config-pcap-tag-loopback")); }
         if !tags.is_empty() {
             s.push_str(&format!("  [{}]", tags.join(",")));
         }
@@ -79,9 +80,7 @@ pub fn enumerate_pcap_ifaces() -> Result<Vec<PcapIface>, String> {
     }
     #[cfg(not(feature = "pcap"))]
     {
-        Err("this build lacks --features pcap; rebuild iris-gui with `--features pcap` \
-             to enumerate and bridge onto host interfaces"
-            .to_string())
+        Err(t!("config-pcap-not-built"))
     }
 }
 
@@ -124,17 +123,17 @@ impl Tab {
         tabs.push(Tab::Bench);
         tabs
     }
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Tab::General => "General",
-            Tab::Disks   => "Disks",
-            Tab::Network => "Networking",
-            Tab::Memory  => "Memory",
-            Tab::Display => "Display",
-            Tab::VideoIn => "Video-In",
-            Tab::Debug   => "Debug",
-            Tab::Ci      => "CI / Automation",
-            Tab::Bench   => "Benchmark",
+            Tab::General => t!("config-tab-general"),
+            Tab::Disks   => t!("config-tab-disks"),
+            Tab::Network => t!("config-tab-network"),
+            Tab::Memory  => t!("config-tab-memory"),
+            Tab::Display => t!("config-tab-display"),
+            Tab::VideoIn => t!("config-tab-video-in"),
+            Tab::Debug   => t!("config-tab-debug"),
+            Tab::Ci      => t!("config-tab-ci"),
+            Tab::Bench   => t!("config-tab-bench"),
         }
     }
 }
@@ -209,8 +208,8 @@ pub fn show_tab(
 
 fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) -> ConfigAction {
     let mut action = ConfigAction::None;
-    ui.heading("General");
-    ui.label(format!("Platform: {}", cfg.machine.profile.label()));
+    ui.heading(t!("config-tab-general"));
+    ui.label(t!("config-platform", platform = cfg.machine.profile.label()));
     ComboBox::from_id_salt("machine_profile")
         .selected_text(cfg.machine.profile.label())
         .show_ui(ui, |ui| {
@@ -230,49 +229,22 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             if *bank > 128 { *bank = 128; }
         }
     }
-    ui.label(
-        RichText::new(
-            "IRIX Software Manager and hinv report IP22 as the platform family on Indy — that is normal. \
-             IP24 is this board's product name.",
-        )
-        .weak()
-        .small(),
-    );
-    ui.label(
-        RichText::new(format!(
-            "The main viewport is the graphics framebuffer (X11 / gfx), not the serial console. \
-             The PROM and login appear on the IRIX serial console (127.0.0.1:{}) until X starts.",
-            cfg.serial_ports()[1],
-        ))
-        .weak()
-        .small(),
-    );
+    subtitle(ui, t!("config-platform-subtitle"));
+    subtitle(ui, t!("config-viewport-subtitle"));
     if cfg.machine.profile == MachineProfile::Indigo2Ip22 {
-        ui.label(
-            RichText::new(
-                "Fullhouse layout: MC SYSID 0x10, dual GIO64, Newport XL @ gfx slot. \
-                 Same IRIX disk images as Indy. With Guest resolution, iris bootstraps \
-                 1280×1024 until IRIX programs the display.",
-            )
-            .weak()
-            .small(),
-        );
+        subtitle(ui, t!("config-indigo2-subtitle"));
     }
     if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
+        subtitle(ui, t!("config-ip28-subtitle"));
         ui.label(
-            RichText::new(
-                "Bring-up: an R10000 module in the Indigo2 chassis, 16 MB MEMCFG \
-                 granule (256/512 MB banks below), RAM at 0x20000000. IRIX carries no \
-                 Newport driver for this board — set Graphics board to an IMPACT \
-                 option below, not Newport.",
-            )
+            RichText::new(t!("config-ip28-graphics-warning"))
             .color(Color32::from_rgb(220, 170, 90))
             .small(),
         );
     }
-        ui.heading("Processor");
+        ui.heading(t!("config-processor"));
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("CPU");
+        ui.label(t!("config-cpu"));
         // A real setting, not a read-out of how this binary was built. Both
         // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
@@ -290,10 +262,10 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         // `[machine] cache`. The R10000 only has the shadow model, so the
         // choice is fixed there.
-        ui.label("Cache model");
+        ui.label(t!("config-cache-model"));
         let r10k = cfg.machine.cpu == CpuModel::R10000;
         ui.add_enabled_ui(!mem_ctx.running && !r10k, |ui| {
-            let shown = if r10k { "Shadow (the only R10000 model)".to_string() } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
+            let shown = if r10k { t!("config-cache-shadow-only") } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
             ComboBox::from_id_salt("cache_model")
                 .selected_text(shown)
                 .show_ui(ui, |ui| {
@@ -302,22 +274,18 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                     }
                 })
                 .response
-                .on_hover_text(
-                    "Full models the caches' tags, data and write-back, which the interpreter \
-                     is fastest with. Shadow keeps data in memory only, with tag arrays just for \
-                     CACHE instructions, which is what jitv2 is fastest with. Auto picks Shadow \
-                     in a jitv2 build and Full otherwise.");
+                .tip(t!("config-cache-model-tip"));
         });
         ui.end_row();
 
-        ui.label("CP0 Count clock");
+        ui.label(t!("config-clock"));
         ui.horizontal(|ui| {
             let auto_default = if cfg.machine.profile.ip28() { 97.5 } else { 33.0 };
             let mut mhz = cfg.clock.fixed_mhz.unwrap_or(auto_default);
             let changed = ui.add(DragValue::new(&mut mhz).range(0.1..=1000.0).suffix(" MHz")).changed();
             if changed { cfg.clock.fixed_mhz = Some(mhz); }
-            if ui.add_enabled(cfg.clock.fixed_mhz.is_some(), egui::Button::new("Auto"))
-                .on_hover_text(format!("Default: {auto_default} MHz — what IRIX reads as CPU speed"))
+            if ui.add_enabled(cfg.clock.fixed_mhz.is_some(), egui::Button::new(t!("common-auto")))
+                .tip(t!("config-clock-auto-tip", mhz = auto_default))
                 .clicked()
             {
                 cfg.clock.fixed_mhz = None;
@@ -328,32 +296,20 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
     if mem_ctx.running {
         ui.label(
-            RichText::new("Stop the VM to change the CPU — it is chosen when the machine starts.")
+            RichText::new(t!("config-cpu-locked"))
                 .color(Color32::from_rgb(220, 170, 90)),
         );
         if let Some(started) = mem_ctx.started_cpu {
             if started != cfg.machine.cpu {
-                ui.label(format!("Running guest: {} · Config (pending): {}",
-                                 started.label(), cfg.machine.cpu.label()));
+                ui.label(t!("config-pending", running = started.label(), pending = cfg.machine.cpu.label()));
             }
         }
     } else {
-        ui.label(RichText::new("Applied at next Start").weak());
+        subtitle(ui, t!("config-cpu-applies-subtitle"));
     }
-    ui.label(RichText::new(
-        "The R4400 has 16 KB direct-mapped caches and is MIPS III. The R5000 has \
-         2-way 32 KB caches, no secondary cache, and adds the MIPS IV instructions — \
-         so an R4400 raises Reserved Instruction on the ones an R5000 executes. IRIX \
-         reads the CPU from PRId and configures itself accordingly, so switching is a \
-         different machine to the guest, not a speed knob.")
-        .weak().small());
+    subtitle(ui, t!("config-cpu-subtitle"));
     if cfg.machine.cpu == CpuModel::R10000 {
-        ui.label(RichText::new(
-            "The R10000 is a shadow cache (loads/stores go straight to memory; the \
-             tag/data arrays only answer CACHE ops and PROM diagnostics), a 64-entry \
-             JTLB, and 44-bit virtual addresses. Bring-up status — pair it with the \
-             IP28 machine profile.")
-            .weak().small());
+        subtitle(ui, t!("config-r10000-subtitle"));
     }
     // jitv2 persistent code cache: lives here (not the Debug tab) so it's
     // reachable from lightning builds too, which hide Debug entirely
@@ -362,18 +318,18 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if build_features::JITV2 {
         ui.add_space(4.0);
         Grid::new("jitv2_cache_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("JIT compile threads");
+            ui.label(t!("config-jit-threads"));
             let max = std::thread::available_parallelism().map_or(8, |n| n.get()).max(1);
             ui.add(DragValue::new(&mut cfg.jitv2.threads).range(1..=max))
-                .on_hover_text("Background threads compiling guest pages ([jitv2] threads). Applied at next Start.");
+                .tip(t!("config-jit-threads-tip"));
             ui.end_row();
-            ui.label("Persistent JIT code cache (IRIS_JIT_CACHE)");
+            ui.label(t!("config-jit-cache"));
             ui.checkbox(&mut cfg.jitv2.cache, "")
-                .on_hover_text("Keep compiled pages on disk across runs and load them instead of recompiling. See docs/jitv2-persistent-cache.md.");
+                .tip(t!("config-jit-cache-tip"));
             ui.end_row();
-            ui.label("Cache directory (IRIS_JIT_CACHE_DIR)");
+            ui.label(t!("config-jit-cache-dir"));
             ui.add(TextEdit::singleline(&mut cfg.jitv2.cache_dir)
-                .hint_text("blank = platform cache dir")
+                .hint_text(t!("config-jit-cache-dir-hint"))
                 .desired_width(280.0));
             ui.end_row();
         });
@@ -383,18 +339,18 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     show_board_picker(ui, cfg, mem_ctx.running);
     if cfg.graphics.board == GraphicsBoard::Newport {
         ui.horizontal(|ui| {
-            ui.label("Newport heads");
+            ui.label(t!("config-newport-heads"));
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
             if cfg.graphics.heads == 2 {
-                ui.label(RichText::new("(dual-head: second REX3 @ GIO slot 1)").weak().small());
+                subtitle(ui, t!("config-newport-dual-subtitle"));
             }
         });
     }
     show_resolution_picker(ui, cfg, false);
     ui.add_space(4.0);
     Grid::new("general_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("PROM image");
-        path_row(ui, "prom", &mut cfg.prom, Pick::OpenFile, PROM_FILTERS);
+        ui.label(t!("config-prom"));
+        path_row(ui, "prom", &mut cfg.prom, Pick::OpenFile, &prom_filters());
         ui.end_row();
 
         // Leaving the PROM path empty boots the built-in PROM. Expose that as
@@ -405,32 +361,29 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         ui.label("");
         ui.horizontal(|ui| {
             let custom = !cfg.prom.is_empty();
-            if ui.add_enabled(custom, egui::Button::new("Use embedded PROM"))
-                .on_hover_text("Boot IRIS's built-in PROM instead of a file")
+            if ui.add_enabled(custom, egui::Button::new(t!("config-prom-builtin")))
+                .tip(t!("config-prom-builtin-tip"))
                 .clicked()
             {
                 action = ConfigAction::RequestEmbeddedProm;
             }
             if !custom {
-                ui.label(RichText::new("(using built-in PROM)").weak());
+                ui.label(RichText::new(t!("config-prom-builtin-active")).weak());
             }
         });
         ui.end_row();
 
-        ui.label("NVRAM file");
-        path_row(ui, "nvram", &mut cfg.nvram, Pick::SaveFile, NVRAM_FILTERS);
+        ui.label(t!("config-nvram"));
+        path_row(ui, "nvram", &mut cfg.nvram, Pick::SaveFile, &nvram_filters());
         ui.end_row();
 
-        ui.label("NVRAM EEPROM file")
-            .on_hover_text(
-                "The motherboard EEPROM (93CS56) — Indigo2/IP28 read `eaddr` and PROM env \
-                 from here, not the NVRAM file above. Indy has no such chip.",
-            );
-        path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, NVRAM_FILTERS);
+        ui.label(t!("config-nveeprom"))
+            .tip(t!("config-nveeprom-tip"));
+        path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, &nvram_filters());
         ui.end_row();
 
-        ui.label("Serial log (ttyd1 -> file)");
-        path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
+        ui.label(t!("config-serial-log"));
+        path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, &any_filters());
         ui.end_row();
     });
 
@@ -447,19 +400,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     {
 
     ui.separator();
-        ui.checkbox(&mut cfg.ultra64.enabled, "N64 development board (Ultra64)")
-            .on_hover_text(
-                "Emulate the SGI Indy N64 development board. Requires the gopher64 \
-                 'ultra64' fork running alongside IRIS; load ROMs with `gload` from \
-                 IRIX. Applies on next Start. See docs/ultra64.md.",
-            );
-        ui.label(
-            RichText::new(
-                "Settings autosave ~600 ms after edits (watch for * next to the machine name). \
-                 Platform, resolution, and Ultra64 apply on the next Stop → Start.")
-            .weak()
-            .small(),
-        );
+        ui.checkbox(&mut cfg.ultra64.enabled, t!("config-ultra64"))
+            .tip(t!("config-ultra64-tip"));
+        subtitle(ui, t!("config-autosave-subtitle"));
     }
 
     action
@@ -475,15 +418,14 @@ pub fn monitor_port(cfg: &MachineConfig) -> u16 {
 /// once (this app and a CLI `iris`, say) need different ones. Read at Start.
 fn show_host_ports(ui: &mut Ui, cfg: &mut MachineConfig) {
     ui.separator();
-    ui.heading("Host ports");
+    ui.heading(t!("config-host-ports"));
     let [def_a, def_b] = iris::dev::z85c30::DEFAULT_PORTS;
     Grid::new("host_ports_grid").num_columns(2).striped(true).show(ui, |ui| {
-        port_row(ui, "Monitor console", "IRIS's debug monitor: telnet 127.0.0.1 on this port.",
+        port_row(ui, t!("config-port-monitor"), t!("config-port-monitor-tip"),
                  &mut cfg.monitor_port, iris::monitor::DEFAULT_PORT);
-        port_row(ui, "Serial port 1 (console, ttyd1)",
-                 "Channel B: the PROM and IRIX console. Help » Serial console connects here.",
+        port_row(ui, t!("config-port-serial1"), t!("config-port-serial1-tip"),
                  &mut cfg.serial_port_b, def_b);
-        port_row(ui, "Serial port 2 (ttyd2)", "Channel A.", &mut cfg.serial_port_a, def_a);
+        port_row(ui, t!("config-port-serial2"), t!("config-port-serial2-tip"), &mut cfg.serial_port_a, def_a);
     });
     let mut ports = vec![monitor_port(cfg), cfg.serial_ports()[0], cfg.serial_ports()[1]];
     if let Some(g) = cfg.gdb_port { ports.push(g); }
@@ -491,24 +433,22 @@ fn show_host_ports(ui: &mut Ui, cfg: &mut MachineConfig) {
     sorted.sort_unstable();
     sorted.dedup();
     if sorted.len() != ports.len() {
-        ui.label(RichText::new("Two of these share a port; only the first to start gets it.")
+        ui.label(RichText::new(t!("config-ports-conflict"))
             .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)).small());
     }
-    ui.label(RichText::new(
-        "Loopback (127.0.0.1) only. Give each machine you run at the same time its own ports. \
-         Applied at next Start.").weak().small());
+    subtitle(ui, t!("config-host-ports-subtitle"));
 }
 
 /// One loopback port setting, where `None` means `default`.
-fn port_row(ui: &mut Ui, label: &str, hover: &str, value: &mut Option<u16>, default: u16) {
-    ui.label(label).on_hover_text(hover);
+fn port_row(ui: &mut Ui, label: String, hover: String, value: &mut Option<u16>, default: u16) {
+    ui.label(label).tip(hover);
     ui.horizontal(|ui| {
         let mut port = value.unwrap_or(default);
         if ui.add(DragValue::new(&mut port).range(1..=65535)).changed() {
             *value = (port != default).then_some(port);
         }
-        if ui.add_enabled(value.is_some(), egui::Button::new("Default"))
-            .on_hover_text(format!("Use {default}"))
+        if ui.add_enabled(value.is_some(), egui::Button::new(t!("common-default")))
+            .tip(t!("config-port-default-tip", port = default.to_string()))
             .clicked()
         {
             *value = None;
@@ -520,9 +460,10 @@ fn port_row(ui: &mut Ui, label: &str, hover: &str, value: &mut Option<u16>, defa
 /// A cache model's menu label; Auto says what it resolves to in this build.
 fn cache_model_label(m: CacheModel, cpu: CpuModel) -> String {
     match m {
-        CacheModel::Auto => format!("Auto ({})", if m.is_shadow(cpu) { "shadow" } else { "full" }),
-        CacheModel::Full => "Full".into(),
-        CacheModel::Shadow => "Shadow".into(),
+        CacheModel::Auto if m.is_shadow(cpu) => t!("config-cache-auto-shadow"),
+        CacheModel::Auto => t!("config-cache-auto-full"),
+        CacheModel::Full => t!("config-cache-full"),
+        CacheModel::Shadow => t!("config-cache-shadow"),
     }
 }
 
@@ -530,15 +471,8 @@ fn cache_model_label(m: CacheModel, cpu: CpuModel) -> String {
 /// live preview of where the guest clock would start right now.
 fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
     ui.separator();
-    ui.heading("Real-time clock");
-    ui.label(
-        RichText::new(
-            "Start the guest clock offset from the host's current time. Type -n or +n in any \
-             field (e.g. Years -18). Years and months step the calendar; the rest add up as time.",
-        )
-        .weak()
-        .small(),
-    );
+    ui.heading(t!("config-rtc"));
+    subtitle(ui, t!("config-rtc-subtitle"));
 
     fn signed(ui: &mut Ui, v: &mut i64) {
         ui.add(
@@ -549,13 +483,13 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
         );
     }
     Grid::new("rtc_offset_grid").num_columns(6).show(ui, |ui| {
-        ui.label("Years");   signed(ui, &mut off.years);
-        ui.label("Months");  signed(ui, &mut off.months);
-        ui.label("Days");    signed(ui, &mut off.days);
+        ui.label(t!("config-rtc-years"));   signed(ui, &mut off.years);
+        ui.label(t!("config-rtc-months"));  signed(ui, &mut off.months);
+        ui.label(t!("config-rtc-days"));    signed(ui, &mut off.days);
         ui.end_row();
-        ui.label("Hours");   signed(ui, &mut off.hours);
-        ui.label("Minutes"); signed(ui, &mut off.minutes);
-        ui.label("Seconds"); signed(ui, &mut off.seconds);
+        ui.label(t!("config-rtc-hours"));   signed(ui, &mut off.hours);
+        ui.label(t!("config-rtc-minutes")); signed(ui, &mut off.minutes);
+        ui.label(t!("config-rtc-seconds")); signed(ui, &mut off.seconds);
         ui.end_row();
     });
 
@@ -565,34 +499,29 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
         .unwrap_or(0);
     let (guest, clamped) = off.apply_clamped(host);
     ui.horizontal(|ui| {
-        ui.label(format!("Guest clock would start at {} UTC", format_unix_utc(guest)));
-        if ui.add_enabled(!off.is_zero(), egui::Button::new("Reset")).clicked() {
+        ui.label(t!("config-rtc-preview", time = format_unix_utc(guest)));
+        if ui.add_enabled(!off.is_zero(), egui::Button::new(t!("config-rtc-reset"))).clicked() {
             *off = RtcOffset::default();
         }
     });
     if clamped {
         ui.label(
-            RichText::new("Outside what the RTC chip can hold (1970–2039); the clock will be clamped.")
+            RichText::new(t!("config-rtc-clamped"))
                 .color(Color32::from_rgb(220, 170, 90)),
         );
     }
-    ui.label(
-        RichText::new(if running {
-            "The running guest keeps its clock; this applies at the next Start. \
-             Restored snapshots keep the time they were saved with."
-        } else {
-            "Applied at next Start. Restored snapshots keep the time they were saved with."
-        })
-        .weak()
-        .small(),
-    );
+    subtitle(ui, if running {
+        t!("config-rtc-running-subtitle")
+    } else {
+        t!("config-rtc-applies-subtitle")
+    });
 }
 
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     let before = cfg.graphics.board;
     let mut choice = before;
     ui.horizontal(|ui| {
-        ui.label("Graphics board");
+        ui.label(t!("config-graphics-board"));
         ui.add_enabled_ui(!running, |ui| {
             ComboBox::from_id_salt("graphics_board")
                 .selected_text(choice.label())
@@ -600,7 +529,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                     for c in GraphicsBoard::ALL {
                         ui.add_enabled_ui(c.supports(cfg.machine.profile), |ui| {
                             ui.selectable_value(&mut choice, c, c.label())
-                                .on_disabled_hover_text("Indigo2 only");
+                                .on_disabled_hover_text(t!("config-graphics-indigo2-only"));
                         });
                     }
                 });
@@ -617,50 +546,30 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     }
     if running {
         ui.label(
-            RichText::new("Stop the VM to change the graphics board — it applies at the next Start.")
+            RichText::new(t!("config-graphics-locked"))
                 .color(Color32::from_rgb(220, 170, 90))
                 .small(),
         );
     }
     if matches!(choice, GraphicsBoard::Xz | GraphicsBoard::Extreme) {
-        ui.label(
-            RichText::new(
-                "GR2 is newer than Newport: PROM, textport, X and GL work, with gaps. \
-                 Single head, guest-programmed resolution.",
-            )
-            .weak()
-            .small(),
-        );
+        subtitle(ui, t!("config-graphics-gr2-subtitle"));
     }
     if choice.is_impact() {
-        ui.label(
-            RichText::new(if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
-                "IMPACT (MGRAS): PROM POST, textport and the 4Dwm desktop work on IP28 — the \
-                 raster engine covers lines, rects, fills, RGB/CI pixels and overlay planes. \
-                 TRAM and 3D GL are not modeled. No Newport fallback — the IP28 IRIX kernel \
-                 carries no Newport driver at all. Single head, guest-programmed resolution."
-            } else {
-                "IMPACT (MGRAS): a register-level model — lines, rects, fills, RGB/CI pixels \
-                 and overlay planes. TRAM and 3D GL are not modeled. Confirmed booting to the \
-                 4Dwm desktop on the IP28 machine profile; untested standalone on IP22. Single \
-                 head, guest-programmed resolution."
-            })
-            .weak()
-            .small(),
-        );
+        subtitle(ui, if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
+            t!("config-graphics-impact-ip28-subtitle")
+        } else {
+            t!("config-graphics-impact-subtitle")
+        });
     }
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless;
     ui.horizontal(|ui| {
-        ui.label("Display resolution");
+        let label = ui.label(t!("config-resolution"));
         if !newport {
-            ui.label(
-                RichText::new("(Newport only — enable graphics, board = newport)")
-                    .weak()
-                    .small(),
-            );
+            label.tip(t!("config-resolution-newport-only-tip"));
+            subtitle(ui, t!("config-resolution-newport-only-subtitle"));
             return;
         }
         ComboBox::from_id_salt("graphics_resolution")
@@ -672,17 +581,10 @@ fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
             });
     });
     if newport {
-        ui.label(
-            RichText::new(
-                "Presets program VC2 at VM Start (standard Indy 4:3 / 5:4 modes). \
-                 Guest leaves timing to IRIX/setmon. Widescreen (1080p) is not supported on Newport hardware.",
-            )
-            .weak()
-            .small(),
-        );
+        subtitle(ui, t!("config-resolution-subtitle"));
         if running {
             ui.label(
-                RichText::new("Stop the VM — resolution applies on next Start.")
+                RichText::new(t!("config-resolution-locked"))
                     .color(Color32::from_rgb(220, 170, 90))
                     .small(),
             );
@@ -691,64 +593,57 @@ fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 }
 
 fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
-    ui.heading("Memory");
+    ui.heading(t!("config-tab-memory"));
     if mem_ctx.running {
         ui.label(
-            RichText::new("Stop the VM to change RAM — edits apply at the next Start.")
+            RichText::new(t!("config-ram-locked"))
                 .color(Color32::from_rgb(220, 170, 90)),
         );
         if let Some(started) = mem_ctx.started_banks {
             if started != cfg.banks {
-                ui.label(format!(
-                    "Running guest: {} · Config (pending): {}",
-                    ram_summary(&started),
-                    ram_summary(&cfg.banks),
+                ui.label(t!("config-pending",
+                    running = ram_summary(&started),
+                    pending = ram_summary(&cfg.banks),
                 ));
             } else {
-                ui.label(format!("Running guest: {}", ram_summary(&started)));
+                ui.label(t!("config-ram-running", ram = ram_summary(&started)));
             }
         }
     } else {
-        ui.label(RichText::new("Applied at next Start").weak());
-        ui.label(
-            RichText::new(
-                "Authentic Indy max is 256 MB. IRIX 6.5 supports 384 MB; IRIX 5.3 up to 512 MB \
-                 (emulator extended layout).",
-            )
-            .weak()
-            .small(),
-        );
+        subtitle(ui, t!("config-ram-applies-subtitle"));
+        subtitle(ui, t!("config-ram-subtitle"));
     }
     let ip28_banks = cfg.machine.profile.ip28();
     ui.add_space(4.0);
-    ui.label("Quick presets:");
+    ui.label(t!("config-ram-presets"));
     ui.horizontal_wrapped(|ui| {
         for &p in ram_presets(ip28_banks) {
             if ui
-                .add_enabled(!mem_ctx.running, egui::Button::new(format!("{p} MB")))
-                .on_disabled_hover_text("Stop the VM to change RAM")
+                .add_enabled(!mem_ctx.running, egui::Button::new(t!("config-megabytes", size = p)))
+                .on_disabled_hover_text(t!("config-ram-locked"))
                 .clicked()
             {
                 cfg.banks = crate::dialogs::new_machine::distribute_ram(p, ip28_banks);
             }
         }
     });
-    ui.label(if ip28_banks {
-        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128, 256, 512 — the IP28 MC only)"
+    ui.label(t!("config-ram-banks"));
+    subtitle(ui, if ip28_banks {
+        t!("config-ram-banks-ip28-subtitle")
     } else {
-        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128 — 256/512 needs the IP28 machine profile)"
+        t!("config-ram-banks-subtitle")
     });
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
         for i in 0..4 {
-            ui.label(format!("Bank {i}"));
+            ui.label(t!("config-ram-bank", bank = i));
             let cur = cfg.banks[i];
             ui.add_enabled_ui(!mem_ctx.running, |ui| {
-                ComboBox::from_id_salt(("bank", i)).selected_text(format!("{cur} MB"))
+                ComboBox::from_id_salt(("bank", i)).selected_text(t!("config-megabytes", size = cur))
                     .show_ui(ui, |ui| {
                         for &sz in VALID_BANK_SIZES {
                             ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
-                                ui.selectable_value(&mut cfg.banks[i], sz, format!("{sz} MB"))
-                                    .on_disabled_hover_text("256/512 MB banks need the IP28 machine profile");
+                                ui.selectable_value(&mut cfg.banks[i], sz, t!("config-megabytes", size = sz))
+                                    .on_disabled_hover_text(t!("config-ram-bank-ip28-only"));
                             });
                         }
                     });
@@ -756,33 +651,33 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
             ui.end_row();
         }
     });
-    ui.label(format!("Total: {}", ram_summary(&cfg.banks)));
+    ui.label(t!("config-ram-total", ram = ram_summary(&cfg.banks)));
 }
 
 fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    ui.heading("Display");
+    ui.heading(t!("config-tab-display"));
     show_resolution_picker(ui, cfg, running);
     ui.add_space(6.0);
     Grid::new("disp_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Window scale");
-        ComboBox::from_id_salt("scale").selected_text(format!("{}×", cfg.scale))
+        ui.label(t!("config-scale"));
+        ComboBox::from_id_salt("scale").selected_text(t!("config-scale-factor", scale = cfg.scale))
             .show_ui(ui, |ui| {
                 for s in 1u32..=4 {
-                    ui.selectable_value(&mut cfg.scale, s, format!("{s}×"));
+                    ui.selectable_value(&mut cfg.scale, s, t!("config-scale-factor", scale = s));
                 }
             });
         ui.end_row();
 
-        ui.label("Headless (no REX3 graphics)");
+        ui.label(t!("config-headless"));
         ui.checkbox(&mut cfg.headless, "");
         ui.end_row();
 
-        ui.label("No audio (disable HAL2)");
+        ui.label(t!("config-no-audio"));
         ui.checkbox(&mut cfg.no_audio, "");
         ui.end_row();
 
-        ui.label("Keyboard")
-            .on_hover_text("The shape of your keyboard, not its language: pick the character layout in the PROM (keybd). ISO and JIS boards have a key left of Enter that the host reports as the US backslash.");
+        ui.label(t!("config-keyboard"))
+            .tip(t!("config-keyboard-tip"));
         ui.add_enabled_ui(!running, |ui| {
             ComboBox::from_id_salt("keyboard_layout").selected_text(cfg.keyboard.label())
                 .show_ui(ui, |ui| {
@@ -795,19 +690,15 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     });
     if !cfg.no_audio {
         ui.separator();
-        ui.heading("Audio (HAL2)");
-        ui.label(
-            RichText::new(format!("Underrun count: monitor telnet 127.0.0.1:{} → hal2 status", monitor_port(cfg)))
-                .weak()
-                .small(),
-        );
+        ui.heading(t!("config-audio"));
+        subtitle(ui, t!("config-audio-subtitle"));
         Grid::new("audio_grid").num_columns(2).striped(true).show(ui, |ui| {
             if cfg!(target_os = "linux") {
-                ui.label("Host audio");
+                ui.label(t!("config-audio-host"));
                 let label = |h: AudioHost| match h {
-                    AudioHost::Default => "Default (ALSA)",
-                    AudioHost::Alsa => "ALSA",
-                    AudioHost::Pulseaudio => "PulseAudio / PipeWire",
+                    AudioHost::Default => t!("config-audio-host-default"),
+                    AudioHost::Alsa => t!("config-audio-host-alsa"),
+                    AudioHost::Pulseaudio => t!("config-audio-host-pulse"),
                 };
                 ComboBox::from_id_salt("audio_host")
                     .selected_text(label(cfg.audio.host))
@@ -818,38 +709,38 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                     });
                 ui.end_row();
             }
-            ui.label("Pre-buffer (ms)");
+            ui.label(t!("config-audio-prebuffer"));
             ui.add(DragValue::new(&mut cfg.audio.prebuf_ms).range(5..=200));
             ui.end_row();
-            ui.label("cpal buffer (frames)");
+            ui.label(t!("config-audio-host-buffer"));
             let mut frames = cfg.audio.cpal_buffer_frames.unwrap_or(0);
             if ui.add(DragValue::new(&mut frames).range(0..=8192)).changed() {
                 cfg.audio.cpal_buffer_frames = if frames == 0 { None } else { Some(frames) };
             }
             ui.end_row();
         });
-        ui.label(RichText::new("44100 Hz preferred when host supports it (see hal2 status).").weak().small());
+        subtitle(ui, t!("config-audio-rate-subtitle"));
     }
 }
 
 fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) {
     let mut edit = PathEdit::default();
     let mut action = ConfigAction::None;
-    ui.heading("SCSI devices");
+    ui.heading(t!("config-scsi"));
     ui.horizontal(|ui| {
-        ui.label("IDs 1–7. CD-ROMs typically use 4–6.");
+        subtitle(ui, t!("config-scsi-subtitle"));
     });
     let mut to_delete: Option<u8> = None;
     for id in 1u8..=7 {
         ui.separator();
         let exists = cfg.scsi.contains_key(&id);
         ui.horizontal(|ui| {
-            ui.strong(format!("scsi{id}"));
+            ui.strong(t!("config-scsi-id", id = id));
             if exists {
-                if ui.button("Remove").clicked() {
+                if ui.button(t!("config-remove")).clicked() {
                     to_delete = Some(id);
                 }
-            } else if ui.button("Attach…").clicked() {
+            } else if ui.button(t!("config-scsi-attach")).clicked() {
                 cfg.scsi.insert(id, ScsiDeviceConfig {
                     path: crate::settings::GuiSettings::default_disk_path(id),
                     ..Default::default()
@@ -862,12 +753,12 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
             // instead of the storage rows below.
             if dev.is_daynaport() {
                 Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
-                    ui.label("Type");
+                    ui.label(t!("config-scsi-type"));
                     scsi_type_combo(ui, id, dev, &mut edit);
                     ui.end_row();
 
-                    ui.label("MAC address")
-                        .on_hover_text("Blank = derived from the SCSI id (00:80:19:44:50:<id>).");
+                    ui.label(t!("config-scsi-mac"))
+                        .tip(t!("config-scsi-mac-tip"));
                     let mut mac = dev.mac.clone().unwrap_or_default();
                     if ui.add(TextEdit::singleline(&mut mac).hint_text("00:80:19:44:50:03")).changed() {
                         dev.mac = if mac.trim().is_empty() { None } else { Some(mac) };
@@ -875,9 +766,8 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     }
                     ui.end_row();
 
-                    ui.label("NAT subnet")
-                        .on_hover_text("This target runs its own NAT gateway, separate from ec0's. \
-                                        Gateway gets .1, the guest gets .2. Blank = 192.168.10.0/24.");
+                    ui.label(t!("config-scsi-subnet"))
+                        .tip(t!("config-scsi-subnet-tip"));
                     let mut subnet = dev.subnet.clone().unwrap_or_default();
                     if ui.add(TextEdit::singleline(&mut subnet).hint_text("192.168.10.0/24")).changed() {
                         dev.subnet = if subnet.trim().is_empty() { None } else { Some(subnet) };
@@ -885,17 +775,14 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     }
                     ui.end_row();
                 });
-                ui.label(RichText::new(
-                    "DaynaPort SCSI/Link — Ethernet over the SCSI bus. The guest needs a driver \
-                     for it (IRIX: github.com/techomancer/irixdayna); IRIX sees it as dp0, separate \
-                     from the onboard ec0.").weak().small());
+                subtitle(ui, t!("config-daynaport-subtitle"));
                 continue;
             }
             Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
-                ui.label("Image path");
+                ui.label(t!("config-scsi-image"));
                 let e = path_row_disk(ui, ("scsi_path", id), &mut dev.path,
                     if dev.scratch { Pick::SaveFile } else { Pick::OpenFile },
-                    DISK_FILTERS);
+                    &disk_filters());
                 edit.changed |= e.changed;
                 edit.picked |= e.picked;
                 // For CD-ROMs, picking a path immediately loads the disc into
@@ -917,13 +804,13 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     let diff = iris::chd_disk::diff_path_for(Path::new(&dev.path));
                     if let Ok(meta) = std::fs::metadata(&diff) {
                         let mb = meta.len() as f64 / (1024.0 * 1024.0);
-                        ui.label("Active overlay");
+                        ui.label(t!("config-scsi-overlay"));
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{}  ({mb:.1} MB)", diff.display()))
+                            ui.label(RichText::new(t!("config-scsi-overlay-file",
+                                    path = diff.display(), size = format!("{mb:.1}")))
                                 .weak().small())
-                                .on_hover_text("This CHD's session changes accumulate here until they're \
-                                                folded back into the disk on a clean exit.");
-                            if ui.small_button("📂").on_hover_text("Reveal in file manager").clicked() {
+                                .tip(t!("config-scsi-overlay-tip"));
+                            if ui.small_button("📂").tip(t!("config-reveal-tip")).clicked() {
                                 reveal_in_file_manager(&diff.to_string_lossy());
                             }
                         });
@@ -931,7 +818,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     }
                 }
 
-                ui.label("Type");
+                ui.label(t!("config-scsi-type"));
                 let was_cd = dev.cdrom;
                 scsi_type_combo(ui, id, dev, &mut edit);
                 // Switching to CD-ROM defaults to an empty drive (no media):
@@ -944,27 +831,23 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 ui.end_row();
                 if dev.cdrom && dev.path.is_empty() {
                     ui.label("");
-                    ui.label(RichText::new("empty drive (no media) — insert a disc via the SCSI menu")
+                    ui.label(RichText::new(t!("config-scsi-cdrom-empty"))
                         .weak().small());
                     ui.end_row();
                 }
 
-                ui.label("Copy-on-write")
-                    .on_hover_text(
-                        "Keep this session's changes in a separate overlay instead of writing the disk \
-                         directly, so you can roll back. Off: changes go into the disk (a compressed CHD \
-                         still uses an overlay, folded back on a clean exit). Raw → .overlay; CHD → \
-                         .diff.chd. Apply or discard with the monitor: `cow commit` / `cow reset`.");
+                ui.label(t!("config-scsi-cow"))
+                    .tip(t!("config-scsi-cow-tip"));
                 ui.checkbox(&mut dev.overlay, "")
-                    .on_hover_text("Keep changes separate (roll back with `cow reset`, apply with `cow commit`)");
+                    .tip(t!("config-scsi-cow-check-tip"));
                 ui.end_row();
 
-                ui.label("Scratch volume");
+                ui.label(t!("config-scsi-scratch"));
                 ui.checkbox(&mut dev.scratch, "");
                 ui.end_row();
 
                 if dev.scratch {
-                    ui.label("Scratch size (MB)");
+                    ui.label(t!("config-scsi-scratch-size"));
                     let mut sz = dev.size_mb.unwrap_or(64);
                     if ui.add(DragValue::new(&mut sz).range(1..=8192)).changed() {
                         dev.size_mb = Some(sz);
@@ -974,18 +857,18 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
             });
 
             if dev.cdrom {
-                ui.label("Extra changer discs:");
+                ui.label(t!("config-scsi-changer"));
                 let mut drop_idx: Option<usize> = None;
                 for (i, disc) in dev.discs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        let e = path_row_disk(ui, ("disc", id, i), disc, Pick::OpenFile, DISK_FILTERS);
+                        let e = path_row_disk(ui, ("disc", id, i), disc, Pick::OpenFile, &disk_filters());
                         edit.changed |= e.changed;
                         edit.picked |= e.picked;
-                        if ui.button("×").clicked() { drop_idx = Some(i); }
+                        if ui.button("×").tip(t!("config-scsi-disc-remove-tip")).clicked() { drop_idx = Some(i); }
                     });
                 }
                 if let Some(i) = drop_idx { dev.discs.remove(i); }
-                if ui.button("+ Add disc").clicked() {
+                if ui.button(t!("config-scsi-add-disc")).clicked() {
                     dev.discs.push(String::new());
                 }
             }
@@ -1037,7 +920,7 @@ fn show_network(
 ) -> NetworkOutcome {
     use crate::netplan;
     let mut out = NetworkOutcome::default();
-    ui.heading("Networking");
+    ui.heading(t!("config-tab-network"));
 
     ethernet_address_row(ui, cfg, running);
     ui.add_space(4.0);
@@ -1050,15 +933,15 @@ fn show_network(
     // a stale `mode = "pcap"` carried in from an imported config.
     if build_features::PCAP {
         Grid::new("net_mode_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("Backend");
+            ui.label(t!("config-net-mode"));
             ComboBox::from_id_salt("net_mode")
                 .selected_text(match cfg.network.mode {
-                    NetMode::Nat  => "NAT gateway",
-                    NetMode::Pcap => "PCAP (bridged)",
+                    NetMode::Nat  => t!("config-net-mode-nat"),
+                    NetMode::Pcap => t!("config-net-mode-pcap"),
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut cfg.network.mode, NetMode::Nat, "NAT gateway");
-                    ui.selectable_value(&mut cfg.network.mode, NetMode::Pcap, "PCAP (bridged)");
+                    ui.selectable_value(&mut cfg.network.mode, NetMode::Nat, t!("config-net-mode-nat"));
+                    ui.selectable_value(&mut cfg.network.mode, NetMode::Pcap, t!("config-net-mode-pcap"));
                 });
             ui.end_row();
         });
@@ -1073,20 +956,15 @@ fn show_network(
                 out.changed = true;
             }
 
-            ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x40),
-                "PCAP mode bridges onto a real interface — the guest joins your real LAN \
-                 directly. The NAT gateway and port forwards don't apply here and are \
-                 hidden below. Requires elevated privileges (root/CAP_NET_RAW on Unix, or \
-                 a WinPcap-compatible driver + Administrator on Windows).");
+            ui.colored_label(Color32::from_rgb(0xd0, 0xa0, 0x40), t!("config-net-pcap-note"));
 
             // Explicit, OS-specific way to grant capture permission up front (the
             // other trigger is automatic: the app pops the same prompt if a
             // pcap-mode machine hits a permission error on Start). The hint text
             // and the action are platform-specific — see `capture_access`.
             ui.horizontal(|ui| {
-                if ui.button("Enable packet capture…")
-                    .on_hover_text("Grant IRIS permission to capture on a real interface. \
-                                    A one-time admin/root step per the note below.")
+                if ui.button(t!("config-net-pcap-enable"))
+                    .tip(t!("config-net-pcap-enable-tip"))
                     .clicked()
                 {
                     out.action = ConfigAction::EnablePacketCapture;
@@ -1102,12 +980,7 @@ fn show_network(
     // they're meaningless — hide the whole block. (The NFS share further below
     // works in both modes.)
     if cfg.network.mode != NetMode::Pcap {
-    ui.label(RichText::new(
-        "IRIS gives the guest its own private NAT network, the same trick your home router uses. \
-         The guest reaches the internet through IRIS, but nothing on your real network can see it. \
-         Pick a subnet that does not overlap a network your computer already uses (Wi-Fi, Ethernet, \
-         VPN, Docker, etc.). If it does, IRIS flags it below.")
-        .weak());
+    subtitle(ui, t!("config-net-nat-subtitle"));
     ui.add_space(6.0);
 
     // The UI exposes the network base address (a plain IPv4, not CIDR) and the
@@ -1151,16 +1024,16 @@ fn show_network(
     let mut committed = false;   // a deliberate commit → eligible for the override modal
 
     Grid::new("nat_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Network");
+        ui.label(t!("config-net-network"));
         ui.horizontal(|ui| {
-            let sel = if net_custom { "Custom".to_string() } else { base.to_string() };
+            let sel = if net_custom { t!("config-net-custom") } else { base.to_string() };
             ComboBox::from_id_salt("net_preset").selected_text(sel).show_ui(ui, |ui| {
                 for addr in fa {
                     if ui.selectable_label(!net_custom && base == addr, addr.to_string()).clicked() {
                         base = addr; net_custom = false; changed = true; committed = true;
                     }
                 }
-                if ui.selectable_label(net_custom, "Custom").clicked() {
+                if ui.selectable_label(net_custom, t!("config-net-custom")).clicked() {
                     net_custom = true;
                     base_text = base.to_string(); // seed the field with the current address
                 }
@@ -1184,15 +1057,15 @@ fn show_network(
         });
         ui.end_row();
 
-        ui.label("Subnet mask");
-        let sel = if mask_custom { format!("Custom  (/{prefix})") } else { netplan::mask_label(prefix) };
+        ui.label(t!("config-net-mask"));
+        let sel = if mask_custom { t!("config-net-mask-custom", prefix = prefix) } else { netplan::mask_label(prefix) };
         ComboBox::from_id_salt("net_mask").selected_text(sel).show_ui(ui, |ui| {
             for &p in netplan::MASK_PRESETS {
                 if ui.selectable_label(!mask_custom && prefix == p, netplan::mask_label(p)).clicked() {
                     prefix = p; mask_custom = false; changed = true; committed = true;
                 }
             }
-            if ui.selectable_label(mask_custom, "Custom").clicked() {
+            if ui.selectable_label(mask_custom, t!("config-net-custom")).clicked() {
                 mask_custom = true;
                 if preset_mask(prefix) { prefix = 24; } // default a fresh custom mask to /24
                 changed = true;
@@ -1216,29 +1089,35 @@ fn show_network(
     // snap note stays consistent across frames.
     let assess = netplan::classify(base, prefix, host);
     if let Some(msg) = &assess.hard_error {
-        ui.label(RichText::new(format!("Invalid: {msg}")).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
+        ui.label(RichText::new(t!("config-net-invalid", reason = msg)).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
     } else if let Some(d) = &assess.derived {
-        ui.label(RichText::new(format!(
-            "Gateway (IRIS host) {}, guest ec0 {}, {} usable hosts, broadcast {}",
-            d.gateway, d.client, netplan::commas(d.usable_hosts), d.broadcast)).weak());
+        ui.label(RichText::new(t!("config-net-derived",
+            gateway = d.gateway.to_string(),
+            guest = d.client.to_string(),
+            hosts = netplan::commas(d.usable_hosts),
+            broadcast = d.broadcast.to_string(),
+        )).weak());
         if let Some(typed) = assess.off_boundary {
-            ui.label(RichText::new(format!(
-                "{typed} is not a network address; using {}/{}.", d.network, d.prefix)).weak());
+            ui.label(RichText::new(t!("config-net-snapped",
+                typed = typed.to_string(),
+                network = d.network.to_string(),
+                prefix = d.prefix,
+            )).weak());
         }
         match &assess.soft {
             Some(w) => {
                 ui.horizontal(|ui| {
                     let sug = netplan::to_cidr(w.suggestion_net, w.suggestion_prefix);
-                    ui.label(RichText::new(format!("Warning: {}", w.reason))
+                    ui.label(RichText::new(t!("config-net-warning", reason = &w.reason))
                         .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)));
-                    if ui.button(format!("Use {sug}")).clicked() {
+                    if ui.button(t!("config-use", value = &sug)).clicked() {
                         cfg.nat_subnet = Some(sug); // external-change re-sync repaints the controls
                         out.changed = true;
                     }
                 });
             }
             None => {
-                ui.label(RichText::new("OK: private range, no conflict with your host networks")
+                ui.label(RichText::new(t!("config-net-ok"))
                     .color(Color32::from_rgb(0x35, 0xb8, 0x4a)));
             }
         }
@@ -1256,28 +1135,28 @@ fn show_network(
     }
 
     ui.separator();
-    ui.strong("Port forwards");
+    ui.strong(t!("config-forwards"));
     let mut drop: Option<usize> = None;
     for (i, pf) in cfg.port_forward.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             let mut c = false;
             ComboBox::from_id_salt(("proto", i))
-                .selected_text(match pf.proto { ForwardProto::Tcp => "tcp", ForwardProto::Udp => "udp" })
+                .selected_text(match pf.proto { ForwardProto::Tcp => t!("config-forward-tcp"), ForwardProto::Udp => t!("config-forward-udp") })
                 .show_ui(ui, |ui| {
-                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Tcp, "tcp").changed();
-                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Udp, "udp").changed();
+                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Tcp, t!("config-forward-tcp")).changed();
+                    c |= ui.selectable_value(&mut pf.proto, ForwardProto::Udp, t!("config-forward-udp")).changed();
                 });
-            ui.label("host");
+            ui.label(t!("config-forward-host"));
             c |= ui.add(DragValue::new(&mut pf.host_port).range(1..=65535)).changed();
-            ui.label("to guest");
+            ui.label(t!("config-forward-guest"));
             c |= ui.add(DragValue::new(&mut pf.guest_port).range(1..=65535)).changed();
             ComboBox::from_id_salt(("bind", i))
-                .selected_text(match pf.bind { ForwardBind::Localhost => "localhost", ForwardBind::Any => "any" })
+                .selected_text(match pf.bind { ForwardBind::Localhost => t!("config-forward-bind-local"), ForwardBind::Any => t!("config-forward-bind-any") })
                 .show_ui(ui, |ui| {
-                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, "localhost").changed();
-                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Any, "any").changed();
+                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Localhost, t!("config-forward-bind-local")).changed();
+                    c |= ui.selectable_value(&mut pf.bind, ForwardBind::Any, t!("config-forward-bind-any")).changed();
                 });
-            if ui.button("Remove").clicked() { drop = Some(i); }
+            if ui.button(t!("config-remove")).clicked() { drop = Some(i); }
             out.changed |= c;
             out.forwards_changed |= c;
         });
@@ -1286,68 +1165,60 @@ fn show_network(
 
     let has_port = |p: u16| cfg.port_forward.iter().any(|f| f.guest_port == p);
     let mut add: Option<PortForwardConfig> = None;
-    ui.menu_button("+ Add forward", |ui| {
-        if ui.add_enabled(!has_port(23), egui::Button::new("Telnet (host 2323 to guest 23)"))
-            .on_hover_text("Log in with: telnet localhost 2323. Needs the guest on IRIS's NAT subnet with telnetd running.")
+    ui.menu_button(t!("config-forward-add"), |ui| {
+        if ui.add_enabled(!has_port(23), egui::Button::new(t!("config-forward-telnet")))
+            .tip(t!("config-forward-telnet-tip"))
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2323, guest_port: 23, bind: ForwardBind::Localhost });
             ui.close();
         }
-        if ui.add_enabled(!has_port(21), egui::Button::new("FTP (host 2121 to guest 21)"))
-            .on_hover_text("Reach the guest's FTP server. Forwards the control port; file transfer also needs the data channel (see docs).")
+        if ui.add_enabled(!has_port(21), egui::Button::new(t!("config-forward-ftp")))
+            .tip(t!("config-forward-ftp-tip"))
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2121, guest_port: 21, bind: ForwardBind::Localhost });
             ui.close();
         }
-        if ui.add_enabled(!has_port(22), egui::Button::new("SSH (host 2222 to guest 22)"))
-            .on_hover_text("Log in with: ssh -p 2222 user@localhost. IRIX ships no sshd — install OpenSSH in the guest first.")
+        if ui.add_enabled(!has_port(22), egui::Button::new(t!("config-forward-ssh")))
+            .tip(t!("config-forward-ssh-tip"))
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2222, guest_port: 22, bind: ForwardBind::Localhost });
             ui.close();
         }
-        if ui.add_enabled(!has_port(5900), egui::Button::new("VNC (host 5901 to guest 5900)"))
-            .on_hover_text("Reach a VNC server on the guest's display :0. Host side is 5901 because macOS Screen Sharing already owns 5900.")
+        if ui.add_enabled(!has_port(5900), egui::Button::new(t!("config-forward-vnc")))
+            .tip(t!("config-forward-vnc-tip"))
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 5901, guest_port: 5900, bind: ForwardBind::Localhost });
             ui.close();
         }
-        if ui.add_enabled(!has_port(177), egui::Button::new("XDMCP (host 11177 to guest 177, UDP)"))
-            .on_hover_text("Remote X login: an X server XDMCP-queries the guest's xdm. Binds all interfaces (LAN X servers OK). Stock X servers use UDP 177 — redirect 177→11177 on the X-server host, or use a chooser that accepts host:port.")
+        if ui.add_enabled(!has_port(177), egui::Button::new(t!("config-forward-xdmcp")))
+            .tip(t!("config-forward-xdmcp-tip"))
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Udp, host_port: 11177, guest_port: 177, bind: ForwardBind::Any });
             ui.close();
         }
-        if ui.button("Custom (empty row)").clicked() {
+        if ui.button(t!("config-forward-custom")).clicked() {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 0, guest_port: 0, bind: ForwardBind::Localhost });
             ui.close();
         }
     });
     if let Some(pf) = add { cfg.port_forward.push(pf); out.changed = true; out.forwards_changed = true; }
 
-    ui.label(RichText::new(
-        "A port forward maps a port on your computer to a port on the guest, so host tools can reach \
-         guest services (log in, copy files, and so on). Inbound only, and it works once the guest is \
-         up on the NAT subnet. None exist by default.")
-        .weak());
+    subtitle(ui, t!("config-forwards-subtitle"));
 
     ui.separator();
     out.changed |= tftp_section(ui, cfg, host);
     } // end: NAT-only section (hidden in PCAP mode)
 
     ui.separator();
-    ui.strong("NFS share");
-    ui.label(RichText::new(
-        "IRIX speaks NFS natively — the easiest way to move files between your computer and the \
-         emulated machine. IRIS serves NFS itself, in-process, backed by the folder you pick below: \
-         nothing to install on any platform, and no NFS setup on the guest side.")
-        .weak());
+    ui.strong(t!("config-nfs"));
+    subtitle(ui, t!("config-nfs-subtitle"));
     let mut has_nfs = cfg.nfs.is_some();
-    if ui.checkbox(&mut has_nfs, "Enable NFS").changed() {
+    if ui.checkbox(&mut has_nfs, t!("config-nfs-enable")).changed() {
         cfg.nfs = if has_nfs {
             Some(NfsConfig { shared_dir: String::new(), version: NfsVersion::Auto })
         } else { None };
@@ -1362,20 +1233,20 @@ fn show_network(
     }
     if let Some(nfs) = cfg.nfs.as_mut() {
         Grid::new("nfs_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("Shared dir");
-            out.changed |= path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, ANY_FILTERS).changed;
+            ui.label(t!("config-nfs-dir"));
+            out.changed |= path_row(ui, "nfs_shared", &mut nfs.shared_dir, Pick::Dir, &any_filters()).changed;
             ui.end_row();
-            ui.label("NFS version");
+            ui.label(t!("config-nfs-version"));
             ComboBox::from_id_salt("nfs_ver")
                 .selected_text(match nfs.version {
-                    NfsVersion::Auto => "Auto",
-                    NfsVersion::V2 => "v2 (IRIX 5.3)",
-                    NfsVersion::V3 => "v3 (IRIX 6.x)",
+                    NfsVersion::Auto => t!("common-auto"),
+                    NfsVersion::V2 => t!("config-nfs-v2"),
+                    NfsVersion::V3 => t!("config-nfs-v3"),
                 })
                 .show_ui(ui, |ui| {
-                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::Auto, "Auto").changed();
-                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V2, "v2 (IRIX 5.3)").changed();
-                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V3, "v3 (IRIX 6.x)").changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::Auto, t!("common-auto")).changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V2, t!("config-nfs-v2")).changed();
+                    out.changed |= ui.selectable_value(&mut nfs.version, NfsVersion::V3, t!("config-nfs-v3")).changed();
                 });
             ui.end_row();
         });
@@ -1387,16 +1258,12 @@ fn show_network(
         if cfg!(feature = "appstore") {
             ui.add_space(4.0);
             if disk_folders.is_empty() {
-                ui.label(RichText::new(
-                    "On the App Store build the shared folder must live somewhere the app has been \
-                     granted. Grant a disk folder first (File » \"Grant a disk folder…\"), then create \
-                     a shared folder inside it here — or pick any folder above to grant it directly.")
-                    .weak());
+                ui.label(RichText::new(t!("config-nfs-appstore-grant")).weak());
             } else {
-                ui.label(RichText::new("Or create a \"shared\" folder inside a granted disk folder:").weak());
+                ui.label(RichText::new(t!("config-nfs-appstore-shared")).weak());
                 for folder in disk_folders {
                     let shared = std::path::Path::new(folder).join("shared");
-                    if ui.button(format!("Use {}", shared.display())).clicked()
+                    if ui.button(t!("config-use", value = shared.display())).clicked()
                         && std::fs::create_dir_all(&shared).is_ok()
                     {
                         nfs.shared_dir = shared.to_string_lossy().into_owned();
@@ -1413,7 +1280,7 @@ fn show_network(
         let gw = if cfg.network.mode == NetMode::Pcap {
             cfg.network.nfs_pcap_ip
                 .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "<NFS IP>".into())
+                .unwrap_or_else(|| t!("config-nfs-ip-placeholder"))
         } else {
             let (b, p) = netplan::parse_cidr(cfg.nat_subnet.as_deref());
             netplan::classify(b, p, host)
@@ -1421,9 +1288,9 @@ fn show_network(
                 .map(|d| d.gateway.to_string())
                 .unwrap_or_else(|| "192.168.0.1".into())
         };
-        ui.label(RichText::new("Pick a folder, boot the guest, then mount it:").weak());
+        ui.label(RichText::new(t!("config-nfs-mount")).weak());
         ui.code(format!("mkdir /shared\nmount {gw}:/ /shared"));
-        ui.label(RichText::new("Your files then appear at /shared on the guest.").weak());
+        subtitle(ui, t!("config-nfs-mount-subtitle"));
     }
 
     out
@@ -1467,9 +1334,12 @@ fn ethernet_address_row(ui: &mut Ui, cfg: &MachineConfig, running: bool) {
 
     let mut commit: Option<[u8; 6]> = None;
     Grid::new("eaddr_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Ethernet address (eaddr)")
-            .on_hover_text(format!("Stored in the {} ({path}).",
-                if eeprom { "NVRAM EEPROM" } else { "NVRAM" }));
+        ui.label(t!("config-eaddr"))
+            .tip(if eeprom {
+                t!("config-eaddr-eeprom-tip", path = path)
+            } else {
+                t!("config-eaddr-nvram-tip", path = path)
+            });
         ui.add_enabled_ui(!running, |ui| {
             ui.horizontal(|ui| {
                 let resp = ui.add(TextEdit::singleline(&mut buf)
@@ -1481,7 +1351,7 @@ fn ethernet_address_row(ui: &mut Ui, cfg: &MachineConfig, running: bool) {
                         Err(e) => msg = e,
                     }
                 }
-                if ui.button("Generate").on_hover_text("A new address in SGI's 08:00:69 range").clicked() {
+                if ui.button(t!("config-eaddr-generate")).tip(t!("config-eaddr-generate-tip")).clicked() {
                     commit = Some(settings::generate_mac_bytes(&format!("{path}{now}")));
                 }
             });
@@ -1499,19 +1369,19 @@ fn ethernet_address_row(ui: &mut Ui, cfg: &MachineConfig, running: bool) {
         };
         msg = match r {
             Ok(true) => String::new(),
-            Ok(false) => format!("couldn't write {path}: no usable file there yet"),
-            Err(e) => format!("couldn't write {path}: {e}"),
+            Ok(false) => t!("config-eaddr-no-file", path = path),
+            Err(e) => t!("config-eaddr-write-failed", path = path, error = e.to_string()),
         };
         buf = settings::mac_to_string(mac);
         ui.data_mut(|d| d.remove::<(String, Option<[u8; 6]>, f64)>(cache_id));
     }
 
     if running {
-        ui.label(RichText::new("Stop the machine to change the Ethernet address.").weak().small());
+        ui.label(RichText::new(t!("config-eaddr-locked")).weak().small());
     } else if !msg.is_empty() {
         ui.label(RichText::new(&msg).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).small());
     } else if current.is_none() && commit.is_none() {
-        ui.label(RichText::new("None set yet. One is generated when the machine starts.").weak().small());
+        ui.label(RichText::new(t!("config-eaddr-unset")).weak().small());
     }
     ui.data_mut(|d| {
         d.insert_temp(buf_id, buf);
@@ -1525,14 +1395,10 @@ fn ethernet_address_row(ui: &mut Ui, cfg: &MachineConfig, running: bool) {
 /// turns the server off. Read at Start. Returns true if the setting changed.
 fn tftp_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> bool {
     let mut changed = false;
-    ui.strong("TFTP boot server");
-    ui.label(RichText::new(
-        "Serves a folder read-only over TFTP at the gateway, so the PROM can boot a kernel \
-         or standalone program over the network, and guest tftp clients can fetch files. \
-         Applied at next Start.")
-        .weak());
+    ui.strong(t!("config-tftp"));
+    subtitle(ui, t!("config-tftp-subtitle"));
     let mut on = cfg.network.tftp_dir.is_some();
-    if ui.checkbox(&mut on, "Enable TFTP").changed() {
+    if ui.checkbox(&mut on, t!("config-tftp-enable")).changed() {
         cfg.network.tftp_dir = if on {
             // A bare relative name, like `nvram`/`disks` — it lives in this
             // machine's own folder (the working directory tracks whichever
@@ -1549,25 +1415,23 @@ fn tftp_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
     }
     if let Some(dir) = cfg.network.tftp_dir.as_mut() {
         Grid::new("tftp_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("TFTP folder");
-            changed |= path_row(ui, "tftp_dir", dir, Pick::Dir, ANY_FILTERS).changed;
+            ui.label(t!("config-tftp-dir"));
+            changed |= path_row(ui, "tftp_dir", dir, Pick::Dir, &any_filters()).changed;
             ui.end_row();
         });
         if dir.trim().is_empty() {
-            ui.label(RichText::new("Pick a folder, or TFTP stays off.").weak().small());
+            ui.label(RichText::new(t!("config-tftp-dir-empty")).weak().small());
         } else if !Path::new(dir.trim()).is_dir() {
-            ui.label(RichText::new("That folder doesn't exist.")
+            ui.label(RichText::new(t!("config-tftp-dir-missing"))
                 .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)).small());
         }
         let (b, p) = crate::netplan::parse_cidr(cfg.nat_subnet.as_deref());
         let gw = crate::netplan::classify(b, p, host).derived
             .map(|d| d.gateway.to_string())
             .unwrap_or_else(|| "192.168.0.1".into());
-        ui.label(RichText::new(
-            "Put a kernel in the folder and boot it from the PROM's Command Monitor \
-             (press Esc at \"Starting up the system\"):").weak());
+        ui.label(RichText::new(t!("config-tftp-boot")).weak());
         ui.code("boot -f bootp()/unix");
-        ui.label(RichText::new(format!("From IRIX, the server is at {gw}:")).weak());
+        ui.label(RichText::new(t!("config-tftp-irix", gateway = &gw)).weak());
         ui.code(format!("tftp {gw}"));
     }
     // A blank field means off, not "serve the working directory".
@@ -1599,9 +1463,9 @@ fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan:
 
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label("NFS server IP");
+        ui.label(t!("config-nfs-pcap-ip"));
         let resp = ui.add(TextEdit::singleline(&mut text)
-            .hint_text("e.g. 192.168.1.213").desired_width(130.0));
+            .hint_text(t!("config-nfs-pcap-ip-hint")).desired_width(130.0));
         if resp.changed() {
             cfg.network.nfs_pcap_ip = text.trim().parse::<std::net::Ipv4Addr>().ok();
             changed = true;
@@ -1609,8 +1473,8 @@ fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan:
         // One-click suggestion: a free address high in the host LAN's host range.
         #[cfg(feature = "pcap")]
         if let Some(ip) = suggest_nfs_ip(cfg, host) {
-            if ui.button(format!("Use {ip}"))
-                .on_hover_text("A free address on your LAN's subnet")
+            if ui.button(t!("config-use", value = ip.to_string()))
+                .tip(t!("config-nfs-pcap-suggest-tip"))
                 .clicked()
             {
                 text = ip.to_string();
@@ -1619,10 +1483,7 @@ fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan:
             }
         }
     });
-    ui.label(RichText::new(
-        "Give the NFS server a free address on the same subnet your guest uses (your real LAN). \
-         Then on the guest: mount it from this IP. No gateway needed — it's reachable directly.")
-        .weak());
+    subtitle(ui, t!("config-nfs-pcap-subtitle"));
 
     ui.data_mut(|d| {
         d.insert_temp(buf_id, text);
@@ -1669,13 +1530,13 @@ fn pcap_interface_picker(
     // value if it's something not in the list (e.g. an index or manual name).
     let current = cfg.network.pcap_interface.clone();
     let selected_text = match &current {
-        None => "Auto-pick (first up, non-loopback)".to_string(),
-        Some(v) if v.is_empty() => "Auto-pick (first up, non-loopback)".to_string(),
+        None => t!("config-pcap-auto"),
+        Some(v) if v.is_empty() => t!("config-pcap-auto"),
         Some(v) => v.clone(),
     };
 
     ui.horizontal(|ui| {
-        ui.label("PCAP interface");
+        ui.label(t!("config-pcap-iface"));
 
         ComboBox::from_id_salt("pcap_iface")
             .selected_text(selected_text)
@@ -1683,7 +1544,7 @@ fn pcap_interface_picker(
             .show_ui(ui, |ui| {
                 // Auto-pick entry.
                 let mut is_auto = current.as_deref().unwrap_or("").is_empty();
-                if ui.selectable_label(is_auto, "Auto-pick (first up, non-loopback)").clicked() {
+                if ui.selectable_label(is_auto, t!("config-pcap-auto")).clicked() {
                     cfg.network.pcap_interface = None;
                     is_auto = true;
                     committed = true;
@@ -1703,20 +1564,20 @@ fn pcap_interface_picker(
                     }
                     Some(Ok(_)) => {
                         ui.separator();
-                        ui.label(RichText::new("(no interfaces enumerated)").weak());
+                        ui.label(RichText::new(t!("config-pcap-none")).weak());
                     }
                     Some(Err(e)) => {
                         ui.separator();
-                        ui.label(RichText::new(format!("(cannot list: {e})")).weak());
+                        ui.label(RichText::new(t!("config-pcap-list-error", error = e)).weak());
                     }
                     None => {
                         ui.separator();
-                        ui.label(RichText::new("(click Refresh to enumerate)").weak());
+                        ui.label(RichText::new(t!("config-pcap-not-listed")).weak());
                     }
                 }
             });
 
-        if ui.button("⟳ Refresh").on_hover_text("Re-enumerate host interfaces").clicked() {
+        if ui.button(t!("common-refresh")).tip(t!("config-pcap-refresh-tip")).clicked() {
             action = ConfigAction::RefreshPcapIfaces;
         }
     });
@@ -1724,10 +1585,10 @@ fn pcap_interface_picker(
     // Manual entry escape hatch: lets the user type an index ("1"), an exact
     // name, or a Windows \Device\NPF_{...} string the dropdown can't show well.
     ui.horizontal(|ui| {
-        ui.label("   or type index/name");
+        ui.label(t!("config-pcap-manual"));
         let mut manual = current.clone().unwrap_or_default();
         let resp = ui.add(TextEdit::singleline(&mut manual)
-            .hint_text("e.g. 1, eth0, or blank = auto")
+            .hint_text(t!("config-pcap-manual-hint"))
             .desired_width(260.0));
         if resp.changed() {
             cfg.network.pcap_interface = if manual.trim().is_empty() { None } else { Some(manual) };
@@ -1741,7 +1602,7 @@ fn pcap_interface_picker(
 
     // Show an inline error if enumeration failed.
     if let Some(Err(e)) = pcap_ifaces {
-        ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), format!("Interface list unavailable: {e}"));
+        ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), t!("config-pcap-list-error", error = e));
     }
 
     (action, committed)
@@ -1749,34 +1610,34 @@ fn pcap_interface_picker(
 
 fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     let mut action = ConfigAction::None;
-    ui.heading("Video-In (IndyCam)");
+    ui.heading(t!("config-vino"));
     Grid::new("vino_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Source");
+        ui.label(t!("config-vino-source"));
         ComboBox::from_id_salt("vino_src")
             .selected_text(match cfg.vino.source {
-                VinoSource::Camera      => "camera",
-                VinoSource::TestPattern => "test_pattern",
-                VinoSource::Black       => "black",
-                VinoSource::Off         => "off (disabled)",
+                VinoSource::Camera      => t!("config-vino-source-camera"),
+                VinoSource::TestPattern => t!("config-vino-source-test"),
+                VinoSource::Black       => t!("config-vino-source-black"),
+                VinoSource::Off         => t!("config-vino-source-off"),
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut cfg.vino.source, VinoSource::Off, "off (disabled)");
-                ui.selectable_value(&mut cfg.vino.source, VinoSource::TestPattern, "test_pattern");
-                ui.selectable_value(&mut cfg.vino.source, VinoSource::Camera, "camera");
-                ui.selectable_value(&mut cfg.vino.source, VinoSource::Black, "black");
+                ui.selectable_value(&mut cfg.vino.source, VinoSource::Off, t!("config-vino-source-off"));
+                ui.selectable_value(&mut cfg.vino.source, VinoSource::TestPattern, t!("config-vino-source-test"));
+                ui.selectable_value(&mut cfg.vino.source, VinoSource::Camera, t!("config-vino-source-camera"));
+                ui.selectable_value(&mut cfg.vino.source, VinoSource::Black, t!("config-vino-source-black"));
             });
         ui.end_row();
 
-        ui.label("Standard");
+        ui.label(t!("config-vino-standard"));
         ComboBox::from_id_salt("vino_std")
-            .selected_text(match cfg.vino.standard { VinoStandard::Ntsc => "ntsc", VinoStandard::Pal => "pal" })
+            .selected_text(match cfg.vino.standard { VinoStandard::Ntsc => t!("config-vino-ntsc"), VinoStandard::Pal => t!("config-vino-pal") })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut cfg.vino.standard, VinoStandard::Ntsc, "ntsc");
-                ui.selectable_value(&mut cfg.vino.standard, VinoStandard::Pal, "pal");
+                ui.selectable_value(&mut cfg.vino.standard, VinoStandard::Ntsc, t!("config-vino-ntsc"));
+                ui.selectable_value(&mut cfg.vino.standard, VinoStandard::Pal, t!("config-vino-pal"));
             });
         ui.end_row();
 
-        ui.label("Camera index");
+        ui.label(t!("config-vino-camera"));
         ui.add(DragValue::new(&mut cfg.vino.camera_index).range(0..=15));
         ui.end_row();
     });
@@ -1787,113 +1648,81 @@ fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     // the VINO/IndyCam source uses.
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button("📷 Test Camera").clicked() {
+        if ui.button(t!("config-vino-test")).clicked() {
             action = ConfigAction::TestCamera;
         }
-        ui.label(
-            RichText::new(format!(
-                "Preview host camera #{} live ({}).",
-                cfg.vino.camera_index,
-                match cfg.vino.standard { VinoStandard::Ntsc => "NTSC", VinoStandard::Pal => "PAL" },
-            ))
-            .weak(),
-        );
+        subtitle(ui, t!("config-vino-test-subtitle"));
     });
-    ui.label(
-        RichText::new(
-            "On first use macOS will ask for camera permission. The camera \
-             is released when you close the preview.",
-        )
-        .weak()
-        .small(),
-    );
+    subtitle(ui, t!("config-vino-permission-subtitle"));
 
     action
 }
 
 fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     let mut action = ConfigAction::None;
-    ui.heading("Build features");
+    ui.heading(t!("config-build"));
     Grid::new("build_features_grid").num_columns(2).striped(true).show(ui, |ui| {
         // What this machine is configured to be, not how the binary was built —
         // all CPU models are always compiled in and selected at start.
-        ui.label("CPU (configured)");
+        ui.label(t!("config-build-cpu"));
         ui.label(cfg.machine.cpu.label());
         ui.end_row();
         // `gpujit` = all three graphics JITs. The App Store build turns them
         // off at run time with IRIS_NO_JIT, so report what will actually run.
         let jit = |built: bool| if !built {
-            "not built"
+            t!("config-build-not-built")
         } else if std::env::var_os("IRIS_NO_JIT").is_some() {
-            "built, off (IRIS_NO_JIT)"
+            t!("config-build-jit-off")
         } else {
-            "enabled at compile time"
+            t!("config-build-jit-on")
         };
-        ui.label("REX3 JIT (Newport)");
+        ui.label(t!("config-build-rex-jit"));
         ui.label(jit(build_features::REX_JIT));
         ui.end_row();
-        ui.label("RE3 JIT (GR2 XZ / Extreme)");
+        ui.label(t!("config-build-gr2-jit"));
         ui.label(jit(build_features::GR2_JIT));
         ui.end_row();
-        ui.label("Raster JIT (IMPACT)");
+        ui.label(t!("config-build-impact-jit"));
         ui.label(jit(build_features::GR4_JIT));
         ui.end_row();
-        ui.label("MIPS JIT (jitv2)");
+        ui.label(t!("config-build-cpu-jit"));
         ui.label(jit(build_features::JITV2));
         ui.end_row();
-        ui.label("Perfetto tracing");
-        ui.label(if cfg!(feature = "perfetto") { "yes" } else { "no — rebuild with --features perfetto" });
+        ui.label(t!("config-build-perfetto"));
+        ui.label(if cfg!(feature = "perfetto") { t!("common-yes") } else { t!("config-build-perfetto-no") });
         ui.end_row();
-        ui.label("Lightning");
-        ui.label(if build_features::LIGHTNING { "yes (no GDB)" } else { "no" });
+        ui.label(t!("config-build-lightning"));
+        ui.label(if build_features::LIGHTNING { t!("config-build-lightning-yes") } else { t!("common-no") });
         ui.end_row();
-        ui.label("Idle pause");
-        ui.label(if build_features::IDLE_PAUSE { "yes" } else { "no" });
+        ui.label(t!("config-build-idle-pause"));
+        ui.label(if build_features::IDLE_PAUSE { t!("common-yes") } else { t!("common-no") });
         ui.end_row();
-        ui.label("PCAP");
-        ui.label(if build_features::PCAP { "yes" } else { "no" });
+        ui.label(t!("config-build-pcap"));
+        ui.label(if build_features::PCAP { t!("common-yes") } else { t!("common-no") });
         ui.end_row();
-        ui.label("Host services / Host GL");
+        ui.label(t!("config-build-hostgl"));
         ui.label(match (build_features::HOSTCALL, build_features::HOSTGL) {
-            (_, true) => "built in — IRIX OpenGL programs render on the host GPU",
+            (_, true) => t!("config-build-hostgl-on"),
             (true, false) if cfg!(any(target_os = "macos", target_os = "linux")) =>
-                "hostcall only — rebuild with --features hostgl for host OpenGL",
+                t!("config-build-hostgl-hostcall-only"),
             (true, false) =>
-                "hostcall only — host GL has no backend on this OS yet (macOS and Linux only)",
-            (false, _) => "not built — rebuild with --features hostgl for host OpenGL",
+                t!("config-build-hostgl-unsupported-os"),
+            (false, _) => t!("config-build-hostgl-off"),
         });
         ui.end_row();
     });
     if build_features::HOSTCALL {
-        ui.label(
-            RichText::new(
-                "Host services answer private syscalls 3000-3009 from IRIX programs built \
-                 against the replacement libGL (github.com/atomchild411/iris-guest-tools) — \
-                 no per-machine setting, a guest either gets the trap or doesn't.",
-            )
-            .weak()
-            .small(),
-        );
+        subtitle(ui, t!("config-build-hostcall-subtitle"));
     }
-    ui.label(
-        RichText::new(
-            "Status-bar MIPS = host emulation throughput. IRIX System Manager MHz \
-             (from hinv) is guest inventory — changing it does not make IRIX faster.",
-        )
-        .weak()
-        .small(),
-    );
+    subtitle(ui, t!("config-build-mips-subtitle"));
     ui.separator();
-    ui.heading("Debug");
+    ui.heading(t!("config-tab-debug"));
     if build_features::LIGHTNING {
-        ui.label(RichText::new(
-            "⚡ Lightning build — interactive debugging is disabled \
-             (no breakpoints, no GDB stub, no traceback). Rebuild without \
-             --features lightning to re-enable.").color(Color32::from_rgb(220, 170, 90)));
+        ui.label(RichText::new(t!("config-debug-lightning")).color(Color32::from_rgb(220, 170, 90)));
         ui.separator();
     } else {
         Grid::new("dbg_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("GDB stub port");
+            ui.label(t!("config-debug-gdb-port"));
             let mut port = cfg.gdb_port.unwrap_or(0);
             if ui.add(DragValue::new(&mut port).range(0..=65535)).changed() {
                 cfg.gdb_port = if port == 0 { None } else { Some(port) };
@@ -1904,58 +1733,54 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     #[cfg(feature = "perfetto")]
     show_perfetto(ui);
     ui.separator();
-    ui.label("Capture (iris-gui framebuffer path)");
+    ui.label(t!("config-debug-capture"));
     Grid::new("capture_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("OpenGL capture (IRIS_GUI_GL)");
+        ui.label(t!("config-debug-gl-capture"));
         ui.checkbox(&mut cfg.debug.gui_gl_capture, "")
-            .on_hover_text("Use GlCompositor on the refresh thread (faster GL demos in GUI). CLI iris.exe is still fastest for recording.");
+            .tip(t!("config-debug-gl-capture-tip"));
         ui.end_row();
     });
-    ui.label(
-        RichText::new(format!("After audio-heavy demos: telnet 127.0.0.1:{} → hal2 status (cpal underruns).", monitor_port(cfg)))
-            .weak()
-            .small(),
-    );
+    subtitle(ui, t!("config-debug-audio-subtitle"));
     ui.separator();
     Grid::new("misc_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Disable idle park (IRIS_NO_IDLE)");
+        ui.label(t!("config-debug-no-idle"));
         ui.checkbox(&mut cfg.debug.no_idle, "");
         ui.end_row();
-        ui.label("Devlog spec (IRIS_DEBUG_LOG)");
-        ui.add(TextEdit::singleline(&mut cfg.debug.debug_log).hint_text("all, or e.g. mc,mips").desired_width(280.0));
+        ui.label(t!("config-debug-log"));
+        ui.add(TextEdit::singleline(&mut cfg.debug.debug_log).hint_text(t!("config-debug-log-hint")).desired_width(280.0));
         ui.end_row();
     });
     ui.separator();
-    ui.label(RichText::new("Build profiles (from repo root):").strong());
+    ui.label(RichText::new(t!("config-debug-profiles")).strong());
     ui.horizontal(|ui| {
-        if ui.button("Rebuild Premiere CLI…").on_hover_text("lightning,rex-jit,idle-pause").clicked() {
+        if ui.button(t!("config-debug-rebuild-cli")).tip(t!("config-debug-rebuild-cli-tip")).clicked() {
             action = ConfigAction::RebuildProfile { gui: false };
         }
-        if ui.button("Rebuild Premiere GUI…").on_hover_text("--features premiere").clicked() {
+        if ui.button(t!("config-debug-rebuild-gui")).tip(t!("config-debug-rebuild-gui-tip")).clicked() {
             action = ConfigAction::RebuildProfile { gui: true };
         }
     });
     ui.monospace("cargo build --release --bin iris --features lightning,rex-jit,idle-pause");
     ui.monospace("cargo build -p iris-gui --release --features premiere");
     ui.separator();
-    ui.heading("Host performance");
+    ui.heading(t!("config-perf"));
     Grid::new("perf_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Thread affinity");
+        ui.label(t!("config-perf-affinity"));
         ui.checkbox(&mut cfg.perf.thread_affinity, "");
         ui.end_row();
-        ui.label("MIPS CPU core");
+        ui.label(t!("config-perf-cpu-core"));
         let mut cpu = cfg.perf.cpu_core.unwrap_or(0) as i32;
         if ui.add(DragValue::new(&mut cpu).range(0..=63)).changed() {
             cfg.perf.cpu_core = Some(cpu as u32);
         }
         ui.end_row();
-        ui.label("REX3 processor core");
+        ui.label(t!("config-perf-rex3-core"));
         let mut rex = cfg.perf.rex3_core.unwrap_or(1) as i32;
         if ui.add(DragValue::new(&mut rex).range(0..=63)).changed() {
             cfg.perf.rex3_core = Some(rex as u32);
         }
         ui.end_row();
-        ui.label("REX3 refresh core");
+        ui.label(t!("config-perf-refresh-core"));
         let mut refc = cfg.perf.refresh_core.unwrap_or(2) as i32;
         if ui.add(DragValue::new(&mut refc).range(0..=63)).changed() {
             cfg.perf.refresh_core = Some(refc as u32);
@@ -1972,7 +1797,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 fn show_perfetto(ui: &mut Ui) {
     use iris::perfetto;
     ui.separator();
-    ui.heading("Perfetto trace");
+    ui.heading(t!("config-perfetto"));
     let path_id  = ui.make_persistent_id("pf_path");
     let cats_id  = ui.make_persistent_id("pf_cats");
     let clock_id = ui.make_persistent_id("pf_guest_clock");
@@ -1990,35 +1815,35 @@ fn show_perfetto(ui: &mut Ui) {
 
     ui.add_enabled_ui(!recording, |ui| {
         Grid::new("perfetto_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("Trace file");
-            path_row(ui, "pf_path_row", &mut path, Pick::SaveFile, &[("Perfetto trace", &["pftrace"]), ("All", &["*"])]);
+            ui.label(t!("config-perfetto-file"));
+            path_row(ui, "pf_path_row", &mut path, Pick::SaveFile, &perfetto_filters());
             ui.end_row();
-            ui.label("Categories");
-            ui.add(TextEdit::singleline(&mut cats).hint_text("all, or e.g. irq,gfx or all,-jit").desired_width(280.0))
-                .on_hover_text(format!("all, or a comma list of: {}",
-                    perfetto::cat::NAMES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")));
+            ui.label(t!("config-perfetto-categories"));
+            ui.add(TextEdit::singleline(&mut cats).hint_text(t!("config-perfetto-categories-hint")).desired_width(280.0))
+                .tip(t!("config-perfetto-categories-tip",
+                    names = perfetto::cat::NAMES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")));
             ui.end_row();
-            ui.label("Clock");
+            ui.label(t!("config-perfetto-clock"));
             ComboBox::from_id_salt("pf_clock")
-                .selected_text(if guest_clock { "Guest instructions" } else { "Host time" })
+                .selected_text(if guest_clock { t!("config-perfetto-clock-guest") } else { t!("config-perfetto-clock-host") })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut guest_clock, false, "Host time");
-                    ui.selectable_value(&mut guest_clock, true, "Guest instructions");
+                    ui.selectable_value(&mut guest_clock, false, t!("config-perfetto-clock-host"));
+                    ui.selectable_value(&mut guest_clock, true, t!("config-perfetto-clock-guest"));
                 })
                 .response
-                .on_hover_text("Guest draws one retired instruction as 1 ns, so slices line up with guest work rather than host speed.");
+                .tip(t!("config-perfetto-clock-tip"));
             ui.end_row();
         });
     });
     ui.horizontal(|ui| {
-        if !recording && ui.button("Start trace").clicked() {
+        if !recording && ui.button(t!("config-perfetto-start")).clicked() {
             let clock = if guest_clock { perfetto::Clock::Guest } else { perfetto::Clock::Host };
             msg = match perfetto::cat::parse(&cats).and_then(|c| perfetto::start(path.trim(), c, clock)) {
                 Ok(()) => String::new(),
                 Err(e) => e,
             };
         }
-        if recording && ui.button("Stop trace").clicked() {
+        if recording && ui.button(t!("config-perfetto-stop")).clicked() {
             msg = perfetto::stop().unwrap_or_else(|e| e);
         }
     });
@@ -2028,7 +1853,7 @@ fn show_perfetto(ui: &mut Ui) {
     } else if !msg.is_empty() {
         ui.label(RichText::new(&msg).small());
     }
-    ui.label(RichText::new("Open the file at ui.perfetto.dev. See docs/perfetto.md.").weak().small());
+    subtitle(ui, t!("config-perfetto-subtitle"));
     ui.data_mut(|d| {
         d.insert_temp(path_id, path);
         d.insert_temp(cats_id, cats);
@@ -2038,38 +1863,39 @@ fn show_perfetto(ui: &mut Ui) {
 }
 
 fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
-    ui.heading("CI / Automation");
-    ui.label("Run `iris --config <machine folder>/<name>.toml` with ci=true from that folder — same hardware as GUI. Windows default socket: 127.0.0.1:19851");
+    ui.heading(t!("config-tab-ci"));
+    subtitle(ui, t!("config-ci-subtitle"));
     Grid::new("ci_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Enable CI mode");
+        ui.label(t!("config-ci-enable"));
         ui.checkbox(&mut cfg.ci, "");
         ui.end_row();
-        ui.label("CI socket (Unix path or host:port)");
-        ui.add(TextEdit::singleline(&mut cfg.ci_socket).desired_width(280.0));
+        ui.label(t!("config-ci-socket"));
+        ui.add(TextEdit::singleline(&mut cfg.ci_socket).desired_width(280.0))
+            .tip(t!("config-ci-socket-tip"));
         ui.end_row();
-        ui.label("Keep window visible (--ci-display)");
+        ui.label(t!("config-ci-display"));
         ui.checkbox(&mut cfg.ci_display, "");
         ui.end_row();
-        ui.label("Serial transcript log");
+        ui.label(t!("config-serial-log"));
         let mut log = cfg.serial_log.clone().unwrap_or_default();
         if ui.add(TextEdit::singleline(&mut log).desired_width(280.0)).changed() {
             cfg.serial_log = if log.is_empty() { None } else { Some(log) };
         }
         ui.end_row();
-        ui.label("Defer SCSI interrupts");
+        ui.label(t!("config-ci-scsi-deferred"));
         ui.checkbox(&mut cfg.scsi_deferred_int, "")
-            .on_hover_text("Required for OpenBSD/NetBSD; disable if SCSI timeouts");
+            .tip(t!("config-ci-scsi-deferred-tip"));
         ui.end_row();
-        ui.label("Lock aspect ratio");
+        ui.label(t!("config-ci-aspect"));
         ui.checkbox(&mut cfg.lock_aspect_ratio, "");
         ui.end_row();
-        ui.label("Scroll pixels per line");
+        ui.label(t!("config-ci-scroll"));
         ui.add(DragValue::new(&mut cfg.mouse_scroll_pixels_per_line).speed(1.0).range(5.0..=200.0));
         ui.end_row();
     });
     ui.add_space(8.0);
     let mut action = ConfigAction::None;
-    if ui.button("Test CI connection (iris-ci ping)").clicked() {
+    if ui.button(t!("config-ci-ping")).clicked() {
         let socket = if iris::config::ci_socket_is_tcp(&cfg.ci_socket) { cfg.ci_socket.clone() } else { crate::abs_path(&cfg.ci_socket) };
         let client = crate::developer_binary("iris-ci");
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -2087,10 +1913,10 @@ fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         });
         ui.ctx().request_repaint();
     }
-    if ui.button("Test in CI (headless boot + ping)").clicked() {
+    if ui.button(t!("config-ci-test")).clicked() {
         action = ConfigAction::TestCi;
     }
-    ui.label(RichText::new("Start iris with this machine TOML and ci=true, then ping.").weak().small());
+    subtitle(ui, t!("config-ci-test-subtitle"));
     action
 }
 
@@ -2142,14 +1968,14 @@ fn scsi_type_combo(ui: &mut Ui, id: u8, dev: &mut ScsiDeviceConfig, edit: &mut P
     let before = kind;
     ComboBox::from_id_salt(("type", id))
         .selected_text(match kind {
-            ScsiKind::Disk => "HDD",
-            ScsiKind::Cdrom => "CD-ROM",
-            ScsiKind::Daynaport => "DaynaPort (Ethernet)",
+            ScsiKind::Disk => t!("config-scsi-type-disk"),
+            ScsiKind::Cdrom => t!("config-scsi-type-cdrom"),
+            ScsiKind::Daynaport => t!("config-scsi-type-daynaport"),
         })
         .show_ui(ui, |ui| {
-            ui.selectable_value(&mut kind, ScsiKind::Disk, "HDD");
-            ui.selectable_value(&mut kind, ScsiKind::Cdrom, "CD-ROM");
-            ui.selectable_value(&mut kind, ScsiKind::Daynaport, "DaynaPort (Ethernet)");
+            ui.selectable_value(&mut kind, ScsiKind::Disk, t!("config-scsi-type-disk"));
+            ui.selectable_value(&mut kind, ScsiKind::Cdrom, t!("config-scsi-type-cdrom"));
+            ui.selectable_value(&mut kind, ScsiKind::Daynaport, t!("config-scsi-type-daynaport"));
         });
     if kind != before {
         edit.changed = true;
@@ -2176,24 +2002,24 @@ fn path_row_in(
     id: impl std::hash::Hash + std::fmt::Debug, // egui 0.35 push_id needs AsIdSalt (Hash + Debug)
     value: &mut String,
     mode: Pick,
-    filters: &[(&str, &[&str])],
+    filters: &[(String, &[&str])],
     anchor: crate::filedialog::Anchor,
 ) -> PathEdit {
     let mut out = PathEdit::default();
     ui.push_id(id, |ui| {
         ui.horizontal(|ui| {
             out.changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
-            if ui.button("📁").on_hover_text("Browse…").clicked() {
+            if ui.button("📁").tip(t!("common-browse")).clicked() {
                 // Open where this file lives, or is headed — never the OS's
                 // remembered folder. See `crate::filedialog`.
                 let purpose = match mode {
                     Pick::SaveFile => crate::filedialog::Purpose::Save,
                     Pick::OpenFile | Pick::Dir => crate::filedialog::Purpose::Open,
                 };
-                let mut d = crate::filedialog::dialog("Browse", value.as_str(), anchor, purpose);
+                let mut d = crate::filedialog::dialog(&t!("config-browse-title"), value.as_str(), anchor, purpose);
                 if matches!(mode, Pick::OpenFile | Pick::SaveFile) {
                     for (label, exts) in filters {
-                        d = d.add_filter(*label, exts);
+                        d = d.add_filter(label.as_str(), exts);
                     }
                 }
                 let picked = match mode {
@@ -2210,7 +2036,7 @@ fn path_row_in(
             // Reveal an existing path in the host file manager (Finder, Explorer,
             // …) so the user can find/open it without navigating by hand.
             if !value.trim().is_empty() && Path::new(value.trim()).exists()
-                && ui.button("📂").on_hover_text("Reveal in file manager").clicked()
+                && ui.button("📂").tip(t!("config-reveal-tip")).clicked()
             {
                 reveal_in_file_manager(value.trim());
             }
@@ -2225,7 +2051,7 @@ fn path_row(
     id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut String,
     mode: Pick,
-    filters: &[(&str, &[&str])],
+    filters: &[(String, &[&str])],
 ) -> PathEdit {
     path_row_in(ui, id, value, mode, filters, crate::filedialog::Anchor::Data)
 }
@@ -2238,7 +2064,7 @@ fn path_row_disk(
     id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut String,
     mode: Pick,
-    filters: &[(&str, &[&str])],
+    filters: &[(String, &[&str])],
 ) -> PathEdit {
     path_row_in(ui, id, value, mode, filters, crate::filedialog::Anchor::Disks)
 }
@@ -2250,19 +2076,32 @@ fn path_row_opt(
     id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut Option<String>,
     mode: Pick,
-    filters: &[(&str, &[&str])],
+    filters: &[(String, &[&str])],
 ) {
     let mut s = value.clone().unwrap_or_default();
     path_row(ui, id, &mut s, mode, filters);
     *value = if s.is_empty() { None } else { Some(s) };
 }
 
-/// Common file filters.
-const PROM_FILTERS:   &[(&str, &[&str])] = &[("PROM image", &["bin"]), ("All", &["*"])];
-const NVRAM_FILTERS:  &[(&str, &[&str])] = &[("NVRAM",      &["bin"]), ("All", &["*"])];
-const DISK_FILTERS:   &[(&str, &[&str])] = &[
-    ("Disk images", &["raw", "img", "chd"]),
-    ("ISO images",  &["iso"]),
-    ("All",         &["*"]),
-];
-const ANY_FILTERS:    &[(&str, &[&str])] = &[("All", &["*"])];
+/// Common file filters: (label, extensions).
+type Filters = Vec<(String, &'static [&'static str])>;
+fn prom_filters() -> Filters {
+    vec![(t!("config-filter-prom"), &["bin"][..]), (t!("config-filter-all"), &["*"][..])]
+}
+fn nvram_filters() -> Filters {
+    vec![(t!("config-filter-nvram"), &["bin"][..]), (t!("config-filter-all"), &["*"][..])]
+}
+fn disk_filters() -> Filters {
+    vec![
+        (t!("config-filter-disk"), &["raw", "img", "chd"][..]),
+        (t!("config-filter-iso"),  &["iso"][..]),
+        (t!("config-filter-all"),  &["*"][..]),
+    ]
+}
+fn any_filters() -> Filters {
+    vec![(t!("config-filter-all"), &["*"][..])]
+}
+#[cfg(feature = "perfetto")]
+fn perfetto_filters() -> Filters {
+    vec![(t!("config-filter-perfetto"), &["pftrace"][..]), (t!("config-filter-all"), &["*"][..])]
+}

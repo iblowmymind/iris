@@ -1252,6 +1252,91 @@ static void t_copy(void)
 
 /* ---- cases: depth and stencil pixels ----------------------------------------------------- */
 
+/* Depth of window rows y..y+h-1, columns x..x+w-1: zl in the first
+   split columns, zr in the rest (drawn as depth components). */
+static void zfill(int x, int y, int w, int h, int split, float zl, float zr)
+{
+    float *z = malloc(w * h * sizeof *z);
+    int i;
+    for (i = 0; i < w * h; i++)
+        z[i] = i % w < split ? zl : zr;
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_ALWAYS);
+    glRasterPos2i(x, y);
+    glDrawPixels(w, h, GL_DEPTH_COMPONENT, GL_FLOAT, z);
+    glDisable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    free(z);
+}
+
+/* Colour glDrawPixels / glCopyPixels with the depth test: the fragments
+   take the raster position's z (0 here: window depth 0.5 whatever the
+   projection's sign) and are tested and written like any other. The
+   destination's depth is 0.25 in its first 6 columns, 0.75 in the rest,
+   so GL_LESS draws only the right part. Variants: 0 draw, 1 draw with
+   the depth mask off, 2 draw with the test off, 3 copy. */
+static void t_depth_colour(void)
+{
+    static const char *vn[] = { "colour-draw/less", "colour-draw/less-nomask", "colour-draw/test-off",
+                                "colour-copy/less" };
+    int w = 13, h = 5, split = 6, v, i;
+    unsigned char img[13 * 5 * 4], got[13 * 5 * 4];
+    float z[13 * 5];
+    for (v = 0; v < 4; v++) {
+        if (!begin("depth/%s", vn[v]))
+            continue;
+        if (!have_depth) {
+            skip("no depth buffer");
+            continue;
+        }
+        reset_state();
+        clear_all();
+        for (i = 0; i < w * h; i++) {
+            img[i * 4] = 0xF0;
+            img[i * 4 + 1] = (unsigned char)(0x10 + i);
+            img[i * 4 + 2] = 0x20;
+            img[i * 4 + 3] = 0xFF;
+        }
+        zfill(100, 60, w, h, split, 0.25f, 0.75f);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        if (v == 3) {
+            glRasterPos2i(20, 30);
+            glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, img);
+        }
+        if (v != 2)
+            glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        if (v == 1)
+            glDepthMask(GL_FALSE);
+        glRasterPos3f(100, 60, 0);
+        if (v == 3)
+            glCopyPixels(20, 30, w, h, GL_COLOR);
+        else
+            glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, img);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_DEPTH_TEST);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(100, 60, w, h, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        glReadPixels(100, 60, w, h, GL_DEPTH_COMPONENT, GL_FLOAT, z);
+        for (i = 0; i < w * h && cur_bad < 6; i++) {
+            int near = i % w < split, drawn = v == 2 || !near;
+            float zwant = drawn && v != 1 && v != 2 ? 0.5f : near ? 0.25f : 0.75f;
+            int k, ok = 1;
+            for (k = 0; k < 3; k++) {
+                int want = drawn ? img[i * 4 + k] : bg8[k];
+                if (abs(got[i * 4 + k] - want) > 1)
+                    ok = 0;
+            }
+            if (!ok)
+                note("(%d,%d) colour %02x%02x%02x, %s", i % w, i / w, got[i * 4], got[i * 4 + 1], got[i * 4 + 2],
+                     drawn ? "should be drawn" : "should be kept (nearer depth)");
+            if (fabs(z[i] - zwant) > 1.0 / 4096)
+                note("(%d,%d) depth %.5f want %.5f", i % w, i / w, z[i], zwant);
+        }
+        end();
+    }
+}
+
 static void t_depth_stencil(void)
 {
     int w = 13, h = 5, i, j;
@@ -2678,6 +2763,7 @@ int main(int argc, char **argv)
     t_zoom();
     t_copy();
     t_depth_stencil();
+    t_depth_colour();
     t_bitmap();
     t_buffers();
     t_tex();

@@ -2699,6 +2699,30 @@ fn gl_point_size_draws_a_square() {
     m.stop_engines();
 }
 
+/// GL_POINT_SMOOTH (token 0x06C [1]): a 9-pixel point is a disc, so the
+/// corners of its 9x9 box stay clear while the edge middles are drawn;
+/// [0] gives the square back.
+#[test]
+fn gl_smooth_point_is_round() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x4D, &[f(9.0)]);
+    fifo_token(&m, 0x6C, &[1]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    fifo_token(&m, 0x16, &[]);
+    fifo_token(&m, 0x00, &[f(50.5), f(50.5), f(0.0)]);
+    fifo_token(&m, 0x20, &[]);
+    for (x, y, on) in [(50, 50, true), (46, 50, true), (54, 50, true), (50, 46, true), (50, 54, true),
+                       (46, 46, false), (54, 54, false), (46, 54, false), (54, 46, false)] {
+        assert_eq!(gl_px(&m, x, y) != 0, on, "smooth: ({x}, {y})");
+    }
+    fifo_token(&m, 0x6C, &[0]);
+    fifo_token(&m, 0x16, &[]);
+    fifo_token(&m, 0x00, &[f(100.5), f(100.5), f(0.0)]);
+    fifo_token(&m, 0x20, &[]);
+    assert!(gl_px(&m, 96, 96) != 0, "square again: corner drawn");
+    m.stop_engines();
+}
+
 /// A textured line: texture coordinates along it, texel by texel.
 #[test]
 fn gl_textured_line() {

@@ -78,6 +78,21 @@ mod tok {
     /// mgrTM_SendTexmode1: on when the bound texture is complete).
     pub const TEX_ON: u32 = 0x00B;
     pub const TEX_OFF: u32 = 0x00C;
+    /// glEnable / glDisable(GL_POINT_SMOOTH): [1] / [0] (libGLcore's
+    /// __glMgrim_Enable; traced).
+    pub const POINT_SMOOTH: u32 = 0x06C;
+    /// Pixel operations and texture loads come between these (libGLcore's
+    /// __glMgrSaveTexmode(1, 0, 0, 0) / __glMgrRestoreTexmode, traced
+    /// around glDrawPixels, glCopyPixels, glTexImage and glCopyTexImage):
+    /// the GE keeps the texture mode aside and draws the operation
+    /// untextured.
+    pub const SAVE_TEXMODE: u32 = 0x0E9;
+    pub const RESTORE_TEXMODE: u32 = 0x0EA;
+    /// A texture load's lookup table: none (mgrTM_DoTexLoad sends this
+    /// where it would send the TL table), and the end of each sub-load
+    /// (after every SEND_PIXELS of the load).
+    pub const TL_NO_TABLE: u32 = 0x09B;
+    pub const TL_SUBLOAD_END: u32 = 0x09C;
     /// GE pixel state (ERAM) writes: [?, ?, bytes, address, 0, 2, count,
     /// values]; the layout PIXEL_STATE also has.
     pub const INIT_PIXEL_STATE_ERAM: u32 = 0x0CD;
@@ -553,6 +568,8 @@ pub struct Gl {
     texgen_plane: u32,
     /// glPointSize.
     point_size: f32,
+    /// GL_POINT_SMOOTH (POINT_SMOOTH).
+    point_smooth: u32,
     /// A texture read transfer is armed (READ_TEXTURE .. RESTORE_RSS).
     tex_reading: u32,
     /// SAVE_RSS's fourth word: the planes the pixel operation transfers
@@ -813,6 +830,11 @@ impl Gl {
                 Some(v.to_bits())
             }
             0x2C4 => Some(1.0f32.to_bits()),
+            // libGLcore reads GE word 3 ([0, 0]) before every texture load
+            // and pixel operation and ignores the answer (traced): a round
+            // trip that waits for the pipeline. What the word holds is not
+            // known.
+            3 => Some(0),
             // Bit 2 (0x4) is the valid flag tested by libGLcore (__glMgrDoGet);
             // bit 0 (0x1) is tested by other callers. Return 0x7 when valid.
             0x2D0 => Some(if self.raster_valid != 0 { 0x7 } else { 0 }),
@@ -1094,6 +1116,10 @@ impl Gl {
             tok::LOAD_RASTER_POS_INFO => {
                 self.color = self.raster_color;
                 if self.ci != 0 { self.current_index = self.color[0] * 4095.0; }
+                // The depth glDrawPixels / glCopyPixels fragments take
+                // (traced: no depth crosses the bus for them, Zmode does).
+                let z = (self.raster[2].clamp(0.0, ZMAX) as f64 * 256.0).round() as u32;
+                sink.rss_write(super::rss::reg::XFER_Z, z, false);
             }
             tok::INDEX_MASK => self.set_state(|g| g.index_mask = w0 & 0xFFF, sink),
             tok::READ_BUFFER => self.read_back = (d.get(2) == Some(&0x405)) as u32,
@@ -1169,6 +1195,13 @@ impl Gl {
             }
             tok::TEX_COORD => self.texcoord = args_f32(d),
             tok::POINT_SIZE => self.point_size = f32::from_bits(w0),
+            tok::POINT_SMOOTH => self.point_smooth = on,
+            // Our pixel paths never texture, which is what the bracket
+            // asks the GE for; the texture state itself stays as it was.
+            tok::SAVE_TEXMODE | tok::RESTORE_TEXMODE => {}
+            // The TE load path here needs neither (an absent table is the
+            // identity; each SEND_PIXELS is a whole sub-load).
+            tok::TL_NO_TABLE | tok::TL_SUBLOAD_END => {}
             tok::TEX_GENIV if d.len() >= 3 && d[0].wrapping_sub(0x2000) < 4 && d[1] == 0x2500 => {
                 self.texgen_mode[(d[0] - 0x2000) as usize] = match d[2] {
                     0x2401 => 0,
@@ -2094,6 +2127,10 @@ impl Gl {
     }
 
     fn point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
+        if self.point_smooth != 0 {
+            self.smooth_point_window(v, sink);
+            return;
+        }
         let size = self.point_size.round().max(1.0);
         let (mut a, mut b) = (v, v);
         if size <= 1.0 {
@@ -2117,6 +2154,43 @@ impl Gl {
         let width = std::mem::replace(&mut self.line_width, size);
         self.line_window(a, b, true, sink);
         self.line_width = width;
+    }
+
+    /// An antialiased point (GL_POINT_SMOOTH): a disc of the point size's
+    /// diameter (not rounded) centred on the point; each pixel it touches
+    /// is drawn with its coverage (4 x 4 samples) multiplying alpha, which
+    /// the application's blending turns into soft edges (OpenGL 1.1 3.3.2).
+    /// Colour index has no alpha: a pixel at least half covered is drawn.
+    /// How the GE11 computes coverage is not known.
+    fn smooth_point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
+        let r = self.point_size.max(1.0) / 2.0;
+        let (x0, x1) = ((v.x - r).floor() as i32, (v.x + r).ceil() as i32);
+        let (y0, y1) = ((v.y - r).floor() as i32, (v.y + r).ceil() as i32);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let mut n = 0;
+                for k in 0..16 {
+                    let sx = px as f32 + ((k % 4) as f32 + 0.5) / 4.0 - v.x;
+                    let sy = py as f32 + ((k / 4) as f32 + 0.5) / 4.0 - v.y;
+                    n += (sx * sx + sy * sy <= r * r) as u32;
+                }
+                if n == 0 || (self.ci != 0 && n < 8) {
+                    continue;
+                }
+                let cov = n as f32 / 16.0;
+                let (mut a, mut b) = (v, v);
+                for w in [&mut a, &mut b] {
+                    w.y = py as f32 + 0.5;
+                    if self.ci == 0 {
+                        w.c[3] *= cov;
+                        w.cb[3] *= cov;
+                    }
+                }
+                a.x = px as f32 + 0.25;
+                b.x = px as f32 + 0.75;
+                self.line_window(a, b, true, sink);
+            }
+        }
     }
 
     /// The PP1 per-fragment registers for the current state (layouts in

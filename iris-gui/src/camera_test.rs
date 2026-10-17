@@ -41,7 +41,7 @@ impl CameraTest {
     /// Start capturing from host camera `index` using `standard`'s field size.
     pub fn start(standard: VideoStandard, index: u32) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
-            status: "opening camera…".into(),
+            status: t!("camera-opening"),
             ..Shared::default()
         }));
         let running = Arc::new(AtomicBool::new(true));

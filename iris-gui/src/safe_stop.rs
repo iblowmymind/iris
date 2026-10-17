@@ -65,12 +65,7 @@ pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
 pub fn reason_lines(r: &UnsafeReasons) -> Vec<String> {
     r.writable_disks
         .iter()
-        .map(|id| {
-            format!(
-                "scsi{id} is a read-write disk image — force-stopping while IRIX \
-                 is running can corrupt its filesystem."
-            )
-        })
+        .map(|id| t!("safestop-writable-disk", id = *id))
         .collect()
 }
 

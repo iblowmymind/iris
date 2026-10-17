@@ -16,6 +16,10 @@ pub struct GuiSettings {
     /// resize the picture, and vice-versa.
     #[serde(default = "default_vm_scale")]
     pub vm_scale: f32,
+    /// GUI language code (a folder under `iris-gui/locales`). Empty follows
+    /// the system language.
+    #[serde(default)]
+    pub language: String,
 
     /// Runtime machine list, discovered from TOML folders. Deserialize the old
     /// JSON field for migration, but never serialize configs back into JSON.
@@ -69,6 +73,7 @@ impl Default for GuiSettings {
         Self {
             ui_scale: UI_SCALE_DEFAULT,
             vm_scale: VM_SCALE_DEFAULT,
+            language: String::new(),
             machines: BTreeMap::new(),
             active_machine: None,
             recent_configs: Vec::new(),
@@ -290,7 +295,7 @@ impl GuiSettings {
     }
 
     pub fn root(&self) -> Result<&Path, String> {
-        self.root.as_deref().ok_or_else(|| "No GUI config directory".into())
+        self.root.as_deref().ok_or_else(|| t!("settings-no-config-dir"))
     }
 
     pub fn machine_dir(&self, name: &str) -> Result<PathBuf, String> {
@@ -312,7 +317,7 @@ impl GuiSettings {
     pub fn load() -> Self {
         match (Self::data_dir(), std::env::current_dir()) {
             (Some(root), Ok(cwd)) => Self::load_in(root, &cwd),
-            _ => Self { errors: vec!["Cannot locate GUI storage or working directory".into()], ..Default::default() },
+            _ => Self { errors: vec![t!("settings-no-storage")], ..Default::default() },
         }
     }
 
@@ -324,15 +329,15 @@ impl GuiSettings {
         let mut s = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Self>(&text) {
                 Ok(s) => s,
-                Err(e) => Self { migration_pending: true, errors: vec![format!("{}: {e}", path.display())], ..Default::default() },
+                Err(e) => Self { migration_pending: true, errors: vec![crate::machines::file_error(&path, e)], ..Default::default() },
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => Self { migration_pending: true, errors: vec![format!("{}: {e}", path.display())], ..Default::default() },
+            Err(e) => Self { migration_pending: true, errors: vec![crate::machines::file_error(&path, e)], ..Default::default() },
         };
         s.root = Some(root.clone());
         if let Some(e) = directory_error {
             s.migration_pending = true;
-            s.errors.push(format!("Cannot create GUI storage: {e}"));
+            s.errors.push(t!("settings-create-error", error = e.to_string()));
         }
         // Restore access before migrating any external battery-backed files.
         crate::macos_sandbox::restore(&s.bookmarks);
@@ -348,7 +353,7 @@ impl GuiSettings {
             let backup = root.join("gui.json.pre-toml.bak");
             let result = (|| -> Result<(), String> {
                 if !backup.exists() {
-                    std::fs::copy(&path, &backup).map_err(|e| format!("Cannot back up GUI preferences: {e}"))?;
+                    std::fs::copy(&path, &backup).map_err(|e| t!("settings-backup-error", error = e.to_string()))?;
                 }
                 for (old_name, cfg) in &s.machines {
                     let name = crate::machines::legacy_name(old_name);
@@ -374,7 +379,7 @@ impl GuiSettings {
                     s.machines.clear();
                     if let Err(e) = s.save() { s.migration_pending = true; s.errors.push(e); }
                 }
-                Err(e) => { s.migration_pending = true; s.errors.push(format!("Machine migration failed: {e}")); }
+                Err(e) => { s.migration_pending = true; s.errors.push(t!("settings-migration-failed", error = e)); }
             }
         }
         let (machines, errors) = crate::machines::discover(&root);
@@ -386,7 +391,7 @@ impl GuiSettings {
 
     pub fn ensure_writable(&self) -> Result<(), String> {
         if self.migration_pending {
-            Err("Resolve the GUI preference/migration error before changing machines".into())
+            Err(t!("settings-locked"))
         } else { Ok(()) }
     }
 
@@ -398,7 +403,7 @@ impl GuiSettings {
     }
 
     pub fn save(&mut self) -> Result<(), String> {
-        if self.migration_pending { return Err("GUI preferences retained because loading or migration failed".into()); }
+        if self.migration_pending { return Err(t!("settings-not-saved")); }
         let root = self.root()?.to_path_buf();
         let paths: Vec<String> = self.machines.iter().flat_map(|(name, cfg)| {
             let dir = crate::machines::directory(&root, name).unwrap();
@@ -455,7 +460,8 @@ mod storage_tests {
         let mut prefs = GuiSettings::load_in(root.0.clone(), &root.0);
         assert!(prefs.errors.is_empty(), "{:?}", prefs.errors);
         assert_eq!(prefs.active_machine.as_deref(), Some("indy"));
-        assert_eq!(prefs.machines["indy"].scsi[&1].path, "../../boot.raw");
+        // Resolved against the old launch directory; outside the machine folder, so absolute.
+        assert_eq!(prefs.machines["indy"].scsi[&1].path, root.0.join("boot.raw").to_string_lossy());
         assert_eq!(std::fs::read_to_string(root.0.join("gui.json.pre-toml.bak")).unwrap(), original_text);
         prefs.save().unwrap();
         let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.0.join("gui.json")).unwrap()).unwrap();

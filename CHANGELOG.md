@@ -12,6 +12,19 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### iris-gui text and languages
+
+- **GUI text was rewritten, and moved into translatable catalogs.** Labels,
+  menus, tooltips and messages are shorter and consistent (sentence case, no
+  register names or config keys in labels), and the explanatory captions
+  under most controls are gone. Every string now lives in Fluent files under
+  `iris-gui/locales/en/`; editing text no longer means editing code. A
+  caption or tooltip left empty in the catalog isn't drawn, so one can be
+  brought back by filling in its value. English is the only language so far:
+  adding one is adding a `locales/<lang>/` folder (`iris-gui/locales/README.md`),
+  and View → Language switches between installed languages, defaulting to the
+  system's.
+
 ### Networking
 
 - **The NAT stack was rebuilt, and is faster and no longer stalls.** Through
