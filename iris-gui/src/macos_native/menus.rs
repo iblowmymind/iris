@@ -23,8 +23,6 @@ pub enum Action {
     SwitchMachine(String),
     RenameMachine,
     DeleteMachine,
-    ImportToml,
-    ExportToml,
     PrepareForPremiere,
     GrantDiskFolder,
     RevealFolder(String),
@@ -202,7 +200,10 @@ impl App {
     }
 
     fn file_menu(&self) -> Menu {
-        let mut items = vec![act("New machine\u{2026}", Action::NewMachine).accel('n')];
+        let can_change = self.emu.can_change_directory();
+        let mut items = vec![
+            act("New machine\u{2026}", Action::NewMachine).accel('n').enabled_if(can_change),
+        ];
 
         let mut machines: Vec<Item> = Vec::new();
         if self.prefs.machines.is_empty() {
@@ -211,25 +212,30 @@ impl App {
         for name in self.prefs.machines.keys() {
             let active = self.prefs.active_machine.as_deref() == Some(name.as_str());
             machines.push(
-                act(name.clone(), Action::SwitchMachine(name.clone())).checked_if(active),
+                act(name.clone(), Action::SwitchMachine(name.clone()))
+                    .checked_if(active)
+                    .enabled_if(can_change),
             );
         }
         items.push(Item::Sub { label: "Switch to machine".into(), items: machines });
 
         let has_active = self.prefs.active_machine.is_some();
-        items.push(act("Rename current\u{2026}", Action::RenameMachine).enabled_if(has_active));
-        items.push(act("Delete current machine", Action::DeleteMachine).enabled_if(has_active));
+        items.push(
+            act("Rename current\u{2026}", Action::RenameMachine).enabled_if(has_active && can_change),
+        );
+        items.push(
+            act("Delete current machine", Action::DeleteMachine).enabled_if(has_active && can_change),
+        );
 
         items.push(Item::Separator);
         items.push(act("Configuration\u{2026}", Action::ShowConfig).accel(','));
 
-        // iris.toml import/export is a source-build affordance for users who
-        // also run the standalone `iris` CLI; the GUI's own gui.json machine
-        // store is the system of record. Hidden in pre-compiled / App Store
-        // builds (the `bundled` feature). See iris-gui Cargo.toml.
+        // A source-build affordance for users who also run the standalone
+        // `iris` CLI: it flushes the active machine's own TOML and reports
+        // the path to run the CLI's --config against (from that machine's
+        // folder — see prepare_for_premiere). Hidden in pre-compiled / App
+        // Store builds (the `bundled` feature). See iris-gui Cargo.toml.
         if !cfg!(feature = "bundled") {
-            items.push(act("Import iris.toml\u{2026}", Action::ImportToml));
-            items.push(act("Export current to iris.toml\u{2026}", Action::ExportToml));
             items.push(act("Prepare for premiere\u{2026}", Action::PrepareForPremiere));
         }
 
@@ -601,38 +607,7 @@ impl App {
             }
             Action::DeleteMachine => {
                 if let Some(name) = self.prefs.active_machine.clone() {
-                    self.prefs.machines.remove(&name);
-                    self.prefs.active_machine = self.prefs.machines.keys().next().cloned();
-                    if let Some(next) = self.prefs.active_machine.clone() {
-                        self.cfg = self.prefs.machines[&next].clone();
-                    } else {
-                        self.cfg = iris::config::MachineConfig::default();
-                        self.new_machine.open();
-                    }
-                    let _ = self.prefs.save();
-                    self.toast(format!("deleted '{name}'"));
-                }
-            }
-            Action::ImportToml => {
-                if let Some(path) =
-                    crate::native_open_dialog("Import iris.toml", &[("TOML", &["toml"])])
-                {
-                    let cfg = iris::config::MachineConfig::load_toml(&path.to_string_lossy());
-                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported");
-                    let name = self.prefs.unique_name(stem);
-                    self.prefs.machines.insert(name.clone(), cfg.clone());
-                    self.prefs.active_machine = Some(name.clone());
-                    self.cfg = cfg;
-                    self.cfg_path = Some(path);
-                    self.flush_machine();
-                    self.toast(format!("imported as '{name}'"));
-                }
-            }
-            Action::ExportToml => {
-                if let Some(path) =
-                    crate::native_save_dialog("Export iris.toml", &[("TOML", &["toml"])])
-                {
-                    self.save_config(path);
+                    self.delete_machine(&name);
                 }
             }
             Action::PrepareForPremiere => self.prepare_for_premiere(),
